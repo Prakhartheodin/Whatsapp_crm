@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>Log in to Booking Collector</title>
+  <meta name="description" content="Sign in to the booking dashboard.">
+  <link rel="stylesheet" href="app.css">
+  <script type="module" src="login.js"></script>
+</head>
+<body class="login-page">
+  <main class="login-card">
+    <h1>Booking Collector</h1>
+    <form id="login-form" novalidate>
+      <label for="username">Username</label>
+      <input id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required>
+      <button type="submit" class="primary">Log in</button>
+      <p id="login-error" class="form-error" role="alert"></p>
+    </form>
+  </main>
+</body>
+</html>

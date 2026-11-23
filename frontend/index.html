@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>Bookings</title>
+  <meta name="description" content="Taxi bookings collected from WhatsApp groups.">
+  <link rel="stylesheet" href="app.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <span class="brand">Booking Collector</span>
+    <a id="pill" class="pill" href="#status" data-tone="none">Checking…</a>
+    <nav class="tabs" aria-label="Screens">
+      <a href="#" data-tab="bookings">
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M9 6h11M9 12h11M9 18h11M4.5 6h.01M4.5 12h.01M4.5 18h.01"/></svg>
+        <span>Bookings</span>
+      </a>
+      <a href="#review" data-tab="review">
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M3 13h5l2 3h4l2-3h5M5.5 5h13L21 13v6H3v-6z"/></svg>
+        <span>Review</span><span id="review-badge" class="badge" hidden></span>
+      </a>
+      <a href="#raw" data-tab="raw">
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 5h16v11H9l-5 4z"/></svg>
+        <span>Raw</span>
+      </a>
+      <a href="#status" data-tab="status">
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M3 12h4l3-7 4 14 3-7h4"/></svg>
+        <span>Status</span>
+      </a>
+      <a href="#export" data-tab="export">
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg>
+        <span>Export</span>
+      </a>
+    </nav>
+    <button id="logout" type="button">Log out</button>
+  </header>
+
+  <main>
+    <section id="screen-bookings" aria-labelledby="h-bookings" hidden>
+      <h1 id="h-bookings" class="sr-only" tabindex="-1">Bookings</h1>
+      <div class="filter-bar">
+        <button type="button" class="filters-toggle" aria-expanded="false" aria-controls="bookings-filters">Filters</button>
+        <ul class="chips" aria-label="Active filters"></ul>
+        <form class="filter-form" id="bookings-filters">
+          <label>Date
+            <select name="preset">
+              <option value="last24">Last 24 hours</option>
+              <option value="today">Today</option>
+              <option value="yesterday">Yesterday</option>
+              <option value="7days">7 days</option>
+              <option value="custom">Custom</option>
+            </select>
+          </label>
+          <label class="custom-only">From <input type="date" name="fromDay"></label>
+          <label class="custom-only">To <input type="date" name="toDay"></label>
+          <label>Source
+            <select name="source"><option value="">All sources</option></select>
+          </label>
+          <label class="search">Search <input type="search" name="q" maxlength="200" autocomplete="off"></label>
+          <button type="button" class="sheet-done primary">Done</button>
+        </form>
+      </div>
+      <div aria-live="polite"><button type="button" class="new-bar" hidden></button></div>
+      <p class="error-bar" role="status" hidden></p>
+      <table class="data bookings">
+        <thead>
+          <tr>
+            <th scope="col">Received</th>
+            <th scope="col">Trip time</th>
+            <th scope="col">Route</th>
+            <th scope="col">Car</th>
+            <th scope="col">Fare</th>
+            <th scope="col">Contact</th>
+            <th scope="col">Source</th>
+          </tr>
+        </thead>
+        <tbody class="list"></tbody>
+      </table>
+      <p class="empty" hidden></p>
+      <button type="button" class="load-more" hidden>Load more</button>
+    </section>
+
+    <section id="screen-review" aria-labelledby="h-review" hidden>
+      <h1 id="h-review" class="sr-only" tabindex="-1">Review</h1>
+      <p class="error-bar" role="status" hidden></p>
+      <div class="list review-list"></div>
+      <p class="empty" hidden>Nothing to review.</p>
+      <p class="note" hidden></p>
+    </section>
+
+    <section id="screen-raw" aria-labelledby="h-raw" hidden>
+      <h1 id="h-raw" class="sr-only" tabindex="-1">Raw messages</h1>
+      <div class="filter-bar">
+        <button type="button" class="filters-toggle" aria-expanded="false" aria-controls="raw-filters">Filters</button>
+        <ul class="chips" aria-label="Active filters"></ul>
+        <form class="filter-form" id="raw-filters">
+          <label>Date
+            <select name="preset">
+              <option value="all">Any time</option>
+              <option value="last24">Last 24 hours</option>
+              <option value="today">Today</option>
+              <option value="yesterday">Yesterday</option>
+              <option value="7days">7 days</option>
+              <option value="custom">Custom</option>
+            </select>
+          </label>
+          <label class="custom-only">From <input type="date" name="fromDay"></label>
+          <label class="custom-only">To <input type="date" name="toDay"></label>
+          <label>Group
+            <select name="group"><option value="">All groups</option></select>
+          </label>
+          <label class="search">Search <input type="search" name="q" maxlength="200" autocomplete="off"></label>
+          <button type="button" class="sheet-done primary">Done</button>
+        </form>
+      </div>
+      <div aria-live="polite"><button type="button" class="new-bar" hidden></button></div>
+      <p class="error-bar" role="status" hidden></p>
+      <ul class="list raw-list"></ul>
+      <p class="empty" hidden></p>
+      <button type="button" class="load-more" hidden>Load more</button>
+    </section>
+
+    <section id="screen-status" aria-labelledby="h-status" hidden>
+      <h1 id="h-status" class="sr-only" tabindex="-1">Status</h1>
+      <p class="error-bar" role="status" hidden></p>
+      <div id="status-body"></div>
+    </section>
+
+    <section id="screen-export" aria-labelledby="h-export" hidden>
+      <h1 id="h-export" class="sr-only" tabindex="-1">Export</h1>
+      <form id="export-form" class="export-form">
+        <label>From date <input type="date" name="fromDay" required></label>
+        <label>To date <input type="date" name="toDay" required></label>
+        <label>Source
+          <select name="source"><option value="">All sources</option></select>
+        </label>
+        <a id="export-link" class="button primary" role="button">Download Excel</a>
+        <p id="export-count" aria-live="polite"></p>
+        <p class="hint">Only confirmed bookings are exported.</p>
+      </form>
+    </section>
+  </main>
+
+  <div id="toast-region" class="toast-region" aria-live="polite"></div>
+</body>
+</html>
