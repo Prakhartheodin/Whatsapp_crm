@@ -5,7 +5,7 @@ import { createRoutes } from './routes.js'
 
 const FRONTEND = fileURLToPath(new URL('../../frontend/', import.meta.url))
 
-/** deps: { models: { Admin, Booking, RawMessage }, config, getHealthState, onConfirmed, logger } */
+/** deps: { models: { Admin, Booking, RawMessage }, config, getHealthState, onConfirmed, pipeline, logger } */
 export function createApp(deps) {
   const { config, logger } = deps
   const auth = createAuth({ Admin: deps.models.Admin, config })
@@ -31,7 +31,7 @@ export function createApp(deps) {
   app.get('/login', (req, res) => res.sendFile('login.html', { root: FRONTEND }))
   app.post('/login', auth.login)
 
-  app.use(['/api', '/health', '/export', '/logout'], auth.requireAuth)
+  app.use(['/api', '/health', '/export', '/logout', '/ingest'], auth.requireAuth)
   app.post('/logout', auth.logout)
   app.get('/api/me', (req, res) => res.json({ username: req.user }))
   app.use(createRoutes(deps))

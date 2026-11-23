@@ -4,3 +4,6 @@ node_modules/
 logs/
 *.log
 /spool/
+# Google service-account keys (keep them outside the project; this is a safety net)
+/secrets/
+*service-account*.json

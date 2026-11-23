@@ -8,11 +8,14 @@ const rawMessageSchema = new mongoose.Schema(
     sender: String,
     text: { type: String, required: true },
     timestamp: { type: Date, required: true, index: true },
+    // Set when the booking pipeline has decided on the message; null rows are re-fed after a restart.
+    processedAt: { type: Date, default: null },
   },
   { collection: 'raw_messages', timestamps: { createdAt: true, updatedAt: false } },
 )
 // WhatsApp can deliver the same message twice (reconnects); this makes inserts idempotent.
 rawMessageSchema.index({ groupId: 1, messageId: 1 }, { unique: true })
+rawMessageSchema.index({ processedAt: 1, timestamp: 1 }) // the unprocessed re-feed at start/reconnect
 
 export const RawMessage = mongoose.model('RawMessage', rawMessageSchema)
 
@@ -55,5 +58,7 @@ bookingSchema.index({ status: 1, receivedAt: -1 })
 bookingSchema.index({ contact: 1, receivedAt: -1 })
 // /api/raw looks up the booking status of each page of raw messages.
 bookingSchema.index({ rawMessageId: 1 })
+// ...and of messages folded in as duplicates (also checked by the unprocessed re-feed).
+bookingSchema.index({ 'otherSources.rawMessageId': 1 })
 
 export const Booking = mongoose.model('Booking', bookingSchema)

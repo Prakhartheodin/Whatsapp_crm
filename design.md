@@ -38,7 +38,8 @@ Items marked **(call)** were decided by the builder, not the owner; change freel
 │   ├── groups.js              # npm run groups
 │   └── create-admin.js        # npm run create-admin [-- --reset]: the single admin
 ├── backend/
-│   ├── index.js               # boot: config -> mongo -> http -> whatsapp -> jobs
+│   ├── index.js               # boot: config -> output/LLM factories (fail fast) -> mongo -> spool replay +
+│   │                          #   re-feed unprocessed -> group names from mongo -> http (+ jobs) -> whatsapp
 │   ├── config.js              # read + validate env, fail fast on bad values
 │   ├── logger.js              # pino + phone masking
 │   ├── models.js              # RawMessage, Booking, Admin
@@ -58,7 +59,7 @@ Items marked **(call)** were decided by the builder, not the owner; change freel
 │   │   ├── index.js           # fan-out to enabled outputs, isolate failures
 │   │   ├── sheets.js
 │   │   ├── telegram.js        # also used for alerts
-│   │   └── whatsapp.js        # wraps whatsapp/send.js
+│   │   └── common.js          # fetch with timeout/retry, IST formatting (WhatsApp send: whatsapp/send.js)
 │   ├── http/
 │   │   ├── server.js          # createApp(deps): express app, headers, static, errors
 │   │   ├── auth.js            # API token + admin session + login rate limit
@@ -67,20 +68,17 @@ Items marked **(call)** were decided by the builder, not the owner; change freel
 │       ├── heartbeat.js
 │       └── retention.js
 ├── frontend/                  # static dashboard served by the backend: index.html, login.html, JS, CSS
-└── test/
-    ├── samples.json           # owner pastes real messages here
-    ├── http.test.js           # API against in-memory fake models
-    ├── scorer.test.js
-    ├── extractor.test.js
-    └── dedupe.test.js
+└── test/                      # one node:test file per module (in-memory fakes, no network), plus:
+    ├── samples.json           # owner pastes real messages here (drives scorer/extractor/dedupe tests)
+    └── boot.test.js           # spawns backend/index.js: fail-fast exits only
 ```
 
 ## 3. Data flow
 ```
-WhatsApp group msg ─┐
-                    ├─> raw_messages (every text msg, target groups only)
-POST /ingest ───────┘        │
-                             v
+WhatsApp group msg ──> raw_messages (every text msg, target groups only; processedAt set
+                             │        once the pipeline decided, unprocessed rows re-fed on start)
+POST /ingest ───────┐        │
+                    └────────v
                     scorer (rules.js)
               score >= HIGH │ LOW < score < HIGH │ score <= LOW
                     │               │                  │
@@ -115,7 +113,10 @@ Hard rules, enforced in code, not by convention:
 - Only one sending function exists (`whatsapp/send.js`). It throws unless
   `WHATSAPP_SEND_ENABLED=true`, sends only to `TARGET_NUMBER`, waits a random
   3-8 s before each send, and allows at most 10 messages per rolling minute
-  (extra messages wait in an in-memory queue).
+  (extra messages wait in an in-memory FIFO queue capped at 100; overflow is dropped
+  with a warning). The caller cannot pass a recipient; sends are sequential and are
+  skipped when the socket is not open. `test/send.test.js` fails if any other file in
+  `backend/` or `scripts/` calls `sendMessage`, `readMessages`, presence or join functions.
 - Auth state persisted in `AUTH_DIR` (default `./auth`, resolved from the project
   folder; multi-file auth state), created/chmod-ed to 0700. It must not live in a
   cloud-synced folder. If valid creds exist, no QR/pairing is ever requested.
@@ -137,7 +138,7 @@ Hard rules, enforced in code, not by convention:
   - Restart required (normal right after pairing): reconnect immediately.
   - Anything else: reconnect with exponential backoff 2 s -> 5 min cap, with jitter.
     The attempt counter resets only after the connection stayed open for 60 s.
-    Telegram alert if still down after `SESSION_DOWN_ALERT_MINUTES`.
+    Telegram alert (from the heartbeat job) if still down after `SESSION_DOWN_ALERT_MINUTES`.
 - MongoDB write failures: the message is appended to `spool/raw.jsonl` (0700 dir) and
   replayed (same idempotent upsert) at start and on every Mongoose `connected`/`reconnected`.
   Lines that fail stay; unreadable lines move to `spool/raw.rejected.jsonl`. Counts only in logs.
@@ -165,9 +166,10 @@ Login: QR drawn in the terminal with `qrcode-terminal` (default). If
 | sender | String | participant JID (phone or LID) |
 | text | String | conversation, extendedText, and image/video captions (a booking posted as a photo with a caption still counts) **(call)** |
 | timestamp | Date | message time |
+| processedAt | Date \| null | set when the booking pipeline has decided (any result); rows still null from the last 48 h are re-fed at start and on MongoDB reconnect, unless a booking already points to them |
 | createdAt | Date | insert time |
 
-Indexes: unique `{groupId, messageId}` (re-delivery safe), `{timestamp: -1}`, text
+Indexes: unique `{groupId, messageId}` (re-delivery safe), `{timestamp: -1}`, `{processedAt, timestamp}` (the re-feed), text
 search is a case-insensitive regex on `text` (volume is small) **(call)**.
 Non-text messages: not stored; logged at info as `{groupId, type}`.
 
@@ -195,7 +197,8 @@ Fields: `username`, `passwordHash` (`scrypt$<salt>$<hash>`), `createdAt`, `updat
 | otherSources | [{source, rawMessageId, receivedAt}] | duplicates folded into this row |
 | outputsSentAt | Date \| null | guards against double output |
 
-Indexes: `{status, receivedAt: -1}`, `{contact, receivedAt: -1}`, `{rawMessageId}` (the Raw tab's booking-status lookup).
+Indexes: `{status, receivedAt: -1}`, `{contact, receivedAt: -1}`, `{rawMessageId}` and `{otherSources.rawMessageId}` (the Raw tab's booking-status lookup, which also reports folded duplicates, and the re-feed).
+A group's source is its last known name (from MongoDB at start, then from WhatsApp); bookings stored with `whatsapp:<groupId>` are renamed once the name is known.
 `rejected` rows are kept: together with admin-confirmed rows they are labelled
 examples for tuning the rules. Bookings are not purged by retention **(call)**;
 only raw messages are.
@@ -209,6 +212,13 @@ signals. Two thresholds, `HIGH` and `LOW`, also in `rules.js`.
 **TODO (needs real samples):** the actual keywords, Hindi/Hinglish variants,
 weights and thresholds. The first version ships with a minimal, clearly marked
 placeholder rule set. No booking formats are invented.
+Built: each group counts once; placeholders are `HIGH=6`, `LOW=2`; booking words
+("cab", "gadi chahiye") weigh 3 so a terse request reaches Review. The
+driver-availability group ("available", "khali", "free car") is a cap, not a
+weight: when it hits, a score above `LOW` always goes to Review (never
+rule-confirmed, never ignored, no LLM call), because customers also ask "car
+available?". All keywords and patterns live only in `rules.js`, each group
+marked `TODO(samples)`. Rule-decided bookings get `confidence = min(1, score / 12)`.
 
 ### Stage b: LLM (`pipeline/llm.js`)
 Interface: `classifyAndExtract(text, receivedAt) -> { isBooking, confidence, fields } | null`.
@@ -216,29 +226,65 @@ Interface: `classifyAndExtract(text, receivedAt) -> { isBooking, confidence, fie
 - Enabled -> one OpenAI API call with a strict JSON output; model from
   `OPENAI_MODEL`. Timeout or error -> treated as `null` (Review), never a crash.
 - LLM says booking with confidence >= `LLM_CONFIRM_THRESHOLD` -> `confirmed`;
-  booking with lower confidence -> `review`; not a booking -> dropped.
+  booking with lower confidence -> `review`; not a booking -> dropped only when
+  `1 - confidence >= LLM_CONFIRM_THRESHOLD` (sure it is not), otherwise `review`.
+- Built: `createLlm(config, { fetch, logger })`, plain `fetch` to
+  `/v1/chat/completions`, JSON-schema structured output, 15 s timeout, one retry
+  on 429/5xx. The message goes in as JSON data; the system prompt says to ignore
+  instructions inside it. The reply is validated strictly (types, confidence
+  0-1, dates with an explicit offset); anything else -> `null` + a warning that
+  holds neither the text nor the key. Enabled without key or model -> throws.
+  Implausible values become empty fields: a contact not among the phone numbers
+  in the message, a fare outside `FARE_MIN`-`FARE_MAX`, a trip time more than 1
+  day before or 1 year after `receivedAt`, text over 100 characters, "".
+- At most `LLM_MAX_IN_FLIGHT` (4) messages wait on the LLM at once; more go
+  straight to Review. Deciding (rules, LLM) runs outside the serial section, so a
+  slow LLM call never delays other messages; only dedupe + store are serial.
 
 ### Extractor (`pipeline/extractor.js`)
 `extract(text, receivedAt) -> { pickup, drop, tripDateTime, carType, fare, contact }`.
 Pure function, regex-based, used when the scorer is confident. Relative dates
 ("kal", "tomorrow", "aaj") resolve against `receivedAt` in IST.
 **TODO (needs real samples):** field patterns.
-A confident score with missing pickup or drop is downgraded to `review`. **(call)**
+A confident score (or a confident LLM answer) with missing pickup or drop is downgraded to `review`. **(call)**
+Built rules: contact = last 10 digits of an Indian mobile number (+91 / 91 / 0
+prefix, spaces or dashes); fare needs a currency or fare word (a bare number is
+not a fare); a time without a date is its next occurrence at or after
+`receivedAt`; a date without a time gives no `tripDateTime`. Two different values
+for a field, or an hour 1-12 without am/pm or a morning/evening word ("8 baje"),
+give `null`: a field is never guessed. Dates: 21/11, 21-11, 21.11.2026, 21 Nov.
+Date-like text the rules cannot read ("Nov 25", "25 tarikh") leaves
+`tripDateTime` empty instead of falling back to the next occurrence; so does
+"kal"/"tomorrow" sent between 00:00 and 04:00 IST, and an explicit date up to 7
+days in the past. Not handled yet: Devanagari script, "raat"/night times.
 
 ## 7. De-duplication (`pipeline/dedupe.js`)
-A new candidate is a duplicate of an existing booking when, within 24 h of
-`receivedAt`:
-- `contact` equal (last 10 digits), and
-- `pickupNorm` and `dropNorm` each match fuzzily, and
-- `tripDateTime` equal to the minute, or both null.
+A new candidate is a duplicate of an existing, non-rejected booking received
+within +-24 h of its `receivedAt` when all of these hold:
+- `contact` equal (last 10 digits), or both without a single contact (none, or
+  several numbers in the message);
+- `carType` and `fare` do not differ where both are present;
+- `tripDateTime` is equal to the minute when both are present;
+- and then either the `rawText` is identical after lowercasing and collapsing
+  whitespace (an exact repost), or (contact present and both trip times present)
+  `pickupNorm` and `dropNorm` each match fuzzily.
+So a missing trip time or contact merges only an exact repost: a dispatcher's
+"Delhi to Agra kal 8 baje" and "... 10 baje" stay two bookings.
 
 Normalisation: lowercase, strip punctuation, collapse spaces, drop filler words
 (list in `rules.js`). Fuzzy match: token-set overlap or small edit distance,
 hand-written (no library). Query narrows by `contact` + time window first, then
-compares in JS.
+compares in JS. Built: two places match when their number tokens are identical
+("sector 62" is not "sector 63", "T1" is not "T3") and at least 75% of the longer
+place's words match; words match when equal, or (letters only, 6+ letters, same
+first letter) one edit apart (Connaught/Conaught yes, Jaipur/Raipur no). A
+missing pickup or drop never matches. The window is +-24 h (an older copy
+processed late still folds in); the earliest match wins. Dedupe and store run one
+message at a time, so copies arriving together cannot both pass.
 - Duplicate: keep the first booking; push `{source, rawMessageId, receivedAt}` to
-  its `otherSources`; no outputs.
-- Candidate without a contact is never de-duplicated. **(call; revisit with samples)**
+  its `otherSources`; no outputs. Exception: a `confirmed` copy of a `review`
+  booking (not one the admin put back in Review) confirms it, fills its empty
+  fields from the copy, and fires the outputs once (same atomic claim).
 - `rejected` bookings do not absorb duplicates.
 
 ## 8. HTTP
@@ -289,8 +335,8 @@ There is no user table and no registration route.
 | GET | `/api/me` | `{ username }` |
 | GET | `/health` | `{ whatsapp: {status, since}, lastMessageAt, perGroup: [{id, name, lastMessageAt, countToday}], counts: {rawToday, bookingsToday, reviewPending, duplicatesToday}, heartbeat: {minutes, windowStart, windowEnd, quiet, lastAlertAt}, outputs: {sheets, telegram, whatsappSend} }`. `perGroup` falls back to the newest stored raw message after a restart |
 | GET | `/export?from=&to=&source=` | streams `.xlsx` of `confirmed` bookings (cursor + streaming writer), `bookings-<from>-<to>.xlsx` (`all` when unset); times in IST |
-| POST | `/ingest` | **not built yet** (needs the pipeline). Body `{source, rawText, receivedAt}`; validated; runs the same pipeline; returns `{status, bookingId?, duplicateOf?}` |
-| GET | `/api/bookings?status=&from=&to=&source=&q=&page=` | paged list (50/page), returns `total` |
+| POST | `/ingest` | JSON body `{source, rawText, receivedAt}`: `source` 1-100 chars, `rawText` 1-4 000 chars, `receivedAt` ISO-8601 with a time zone, at most 5 min in the future and 7 days in the past (else `400`); runs the same pipeline; returns `{status: confirmed|review|duplicate|ignored, bookingId?, duplicateOf?}` |
+| GET | `/api/bookings?status=&from=&to=&source=&q=&page=` | paged list (50/page), returns `total`. `q` matches pickup, drop, contact or raw text (case-insensitive); `source` matches the primary source or any folded duplicate's (`otherSources`), here and in `/export` |
 | POST | `/api/bookings/:id/confirm` | review -> confirmed; fires outputs once (claims `outputsSentAt` atomically) |
 | POST | `/api/bookings/:id/reject` | review -> rejected |
 | POST | `/api/bookings/:id/undo` | admin-decided confirmed/rejected -> review (the Undo toast); does not unsend outputs, returns `outputsAlreadySent` |
@@ -308,10 +354,20 @@ max 200 chars; `/ingest` text capped at 4 000 chars). TLS is terminated by a rev
 - **Heartbeat** (every 5 min): between 08:00 and 23:00 IST, if no message from
   any target group for `HEARTBEAT_MINUTES` (default 120) -> one Telegram alert,
   then silent until a message arrives (no repeat spam). Last-message time is read
-  from `raw_messages`, so a restart does not reset it. Session-drop alerts come
-  from the connection module.
+  from `raw_messages`, so a restart does not reset it. The quiet period does not
+  count the night: from 08:00 it counts from max(last message, 08:00 IST today).
+  Session: WhatsApp status other than `open` for `SESSION_DOWN_ALERT_MINUTES`
+  (default 10, counted from the first check that saw it down) -> one alert naming
+  the status, and one "back online" alert when it returns. Stop statuses
+  (`logged_out`, `replaced`, `blocked`, `needs_link`) alert at once (the connection's `onStop`
+  runs a check; checks are serialized, so it is sent once). With Telegram off, alerts are logged once.
+  An alert Telegram did not accept is retried at the next check.
 - **Retention** (daily, and once at boot): delete `raw_messages` older than
-  `RETENTION_DAYS`. `0` disables purging.
+  `RETENTION_DAYS` (default 30). `0` disables purging; negative or non-numeric
+  values stop the service at start. Logs the deleted count only. Bookings are kept.
+- Outputs (`outputs/`): Telegram and Sheets use built-in `fetch` (10 s timeout, one
+  retry on 429/5xx; failures logged without URL or token, never thrown). Sheets signs
+  the service-account JWT (RS256) with `node:crypto` and caches the token.
 
 ## 10. Logging and privacy
 - pino JSON logs; pm2 handles files/rotation.
@@ -333,8 +389,9 @@ API_TOKEN, SESSION_SECRET (required, >= 32 chars each; the service refuses to st
 # llm
 LLM_ENABLED=false, OPENAI_API_KEY, OPENAI_MODEL, LLM_CONFIRM_THRESHOLD=0.8
 # outputs
-SHEETS_ENABLED=false, GOOGLE_SHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON (path),
+SHEETS_ENABLED=false, GOOGLE_SHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON (path), GOOGLE_SHEET_RANGE=Sheet1!A1,
 TELEGRAM_ENABLED=false, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+# (Telegram alerts and Sheets rows contain full phone numbers and leave this server)
 # housekeeping
 HEARTBEAT_MINUTES=120, RETENTION_DAYS=30
 ```
@@ -365,21 +422,31 @@ HEARTBEAT_MINUTES=120, RETENTION_DAYS=30
 - `isBooking` is required; omit any other `expected` field you don't care about.
 - `duplicateOf` holds the `id` of an earlier sample this should be folded into.
 - The file starts with a few placeholder examples, clearly marked as placeholders.
+  Replace them with real messages when the owner supplies them.
+- Contract checked per sample: a booking scores above `LOW` (never silently
+  dropped), a non-booking scores below `HIGH` (never auto-confirmed); each listed
+  `expected` field must match `extract()`; each booking sample folds into exactly
+  its `duplicateOf` (or nothing) against the earlier booking samples.
+- `test/fake-booking.js` is an in-memory Booking model for the dedupe and pipeline tests.
 
 ## 13. Build order
-| # | Step | Stop? |
-|---|---|---|
-| 1 | Connection: pairing login, saved session, reconnect | |
-| 2 | `npm run groups` | |
-| 3 | Raw capture into `raw_messages` | **Stop. Owner links number, confirms capture, supplies samples** |
-| 4 | Detection: scorer, then LLM interface | needs samples |
-| 5 | Extraction into `bookings` | needs samples |
-| 6 | De-duplication | |
-| 7 | Outputs: Sheets, Telegram, WhatsApp send | |
-| 8 | HTTP API: health, export, ingest | |
-| 9 | Heartbeat + retention | |
-| 10 | Dashboard: login, Bookings, Review, Raw, Status, Export | |
-| 11 | README, `.env.example` final pass | |
+| # | Step | Stop? | State |
+|---|---|---|---|
+| 1 | Connection: pairing login, saved session, reconnect | | Built |
+| 2 | `npm run groups` | | Built |
+| 3 | Raw capture into `raw_messages` | **Stop. Owner links number, confirms capture, supplies samples** | Built; owner has not linked or supplied samples yet |
+| 4 | Detection: scorer, then LLM interface | needs samples | Built with placeholder rules |
+| 5 | Extraction into `bookings` | needs samples | Built with placeholder rules |
+| 6 | De-duplication | | Built |
+| 7 | Outputs: Sheets, Telegram, WhatsApp send | | Built |
+| 8 | HTTP API: health, export, ingest | | Built |
+| 9 | Heartbeat + retention | | Built |
+| 10 | Dashboard: login, Bookings, Review, Raw, Status, Export | | Built |
+| 11 | README, `.env.example` final pass | | Done |
+
+"Built" = covered by `npm test` with in-memory fakes. Nothing has run against a real WhatsApp
+number, MongoDB, Telegram, Google or OpenAI yet. Rules in `pipeline/rules.js` stay placeholders
+until real samples are in `test/samples.json`.
 
 `.env.example`, `.gitignore`, logger and config land with step 1.
 

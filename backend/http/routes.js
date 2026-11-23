@@ -59,7 +59,8 @@ const bySource = (q) => anyOf(['source', 'otherSources.source'], text(q, 'source
 const allOf = (...cs) => (cs.some(Boolean) ? cs.filter(Boolean) : undefined)
 
 // ---- response shapes from the API contract ----
-const toBooking = (d) => ({
+// Also the one shape outputs receive (index.js maps the pipeline's Mongoose document with it).
+export const toBooking = (d) => ({
   id: String(d._id), source: d.source, rawText: d.rawText, pickup: d.pickup, drop: d.drop,
   tripDateTime: d.tripDateTime ?? null, carType: d.carType ?? null, fare: d.fare ?? null, contact: d.contact ?? null,
   receivedAt: d.receivedAt, confidence: d.confidence, status: d.status, decidedBy: d.decidedBy, decidedAt: d.decidedAt,
@@ -68,7 +69,7 @@ const toBooking = (d) => ({
 // "919876543210:3@s.whatsapp.net" -> "91xxxxxxxx10"; "me" and empty stay as they are.
 const maskSender = (s) => (!s || s === 'me' ? s : maskPhone(s.split(/[:@]/)[0]))
 
-export function createRoutes({ models: { Booking, RawMessage }, config, getHealthState, onConfirmed, logger }) {
+export function createRoutes({ models: { Booking, RawMessage }, config, getHealthState, onConfirmed, pipeline, logger }) {
   const r = Router()
 
   r.get('/api/bookings', async (req, res) => {
@@ -108,7 +109,7 @@ export function createRoutes({ models: { Booking, RawMessage }, config, getHealt
     const item = toBooking(doc)
     // outputsSentAt is claimed atomically, so outputs fire once per booking even across undo + confirm;
     // status in the filter: an undo landing between the two writes must not fire them.
-    // TODO(step 7): claim-then-send is at-most-once; a crash or failed output is not retried.
+    // shortcut: claim-then-send is at-most-once (a crash or failed output is not retried); add an outbox if that bites.
     const claimed = !doc.outputsSentAt &&
       (await Booking.updateOne({ _id: doc._id, status: 'confirmed', outputsSentAt: null }, { $set: { outputsSentAt: new Date() } })).modifiedCount === 1
     if (claimed) {
@@ -127,6 +128,24 @@ export function createRoutes({ models: { Booking, RawMessage }, config, getHealt
     if (doc) res.json({ item: toBooking(doc), outputsAlreadySent: Boolean(doc.outputsSentAt) })
   })
 
+  // Same pipeline as WhatsApp messages; the text lives only on the booking (not in raw_messages).
+  r.post('/ingest', async (req, res) => {
+    const { source, rawText, receivedAt } = req.body ?? {}
+    if (typeof source !== 'string' || !source.trim() || source.length > 100) throw badRequest('Invalid source: text of 1-100 characters.')
+    if (typeof rawText !== 'string' || !rawText.trim() || rawText.length > 4000) throw badRequest('Invalid rawText: text of 1-4000 characters.')
+    let at
+    try {
+      // A bare date (10 chars) is not a moment in time.
+      at = typeof receivedAt === 'string' && receivedAt.length > 10 && date(req.body, 'receivedAt')
+    } catch {}
+    if (!at) throw badRequest('Invalid receivedAt: use an ISO-8601 timestamp with a time zone, e.g. 2026-11-23T09:15:00+05:30.')
+    if (at.getTime() > Date.now() + 5 * 60_000) throw badRequest('Invalid receivedAt: more than 5 minutes in the future.')
+    // Dedupe only looks 24 h around receivedAt, so a re-sent old message with a shifted time would fire outputs again.
+    if (at.getTime() < Date.now() - 7 * 86_400_000) throw badRequest('Invalid receivedAt: more than 7 days in the past.')
+    const { status, bookingId, duplicateOf } = await pipeline.processMessage({ source, rawText, receivedAt: at })
+    res.json({ status, ...(bookingId && { bookingId: String(bookingId) }), ...(duplicateOf && { duplicateOf: String(duplicateOf) }) })
+  })
+
   r.get('/api/raw', async (req, res) => {
     const group = text(req.query, 'group', 100)
     if (group !== undefined && !/^[\d-]+@g\.us$/.test(group)) throw badRequest('Invalid group.')
@@ -136,8 +155,14 @@ export function createRoutes({ models: { Booking, RawMessage }, config, getHealt
       RawMessage.find(f).sort({ timestamp: -1, _id: -1 }).skip((p - 1) * PAGE_SIZE).limit(PAGE_SIZE).lean(),
       RawMessage.countDocuments(f),
     ])
-    const linked = await Booking.find({ rawMessageId: { $in: docs.map((d) => d._id) } }, { rawMessageId: 1, status: 1 }).lean()
-    const statusOf = new Map(linked.map((b) => [String(b.rawMessageId), b.status]))
+    const ids = docs.map((d) => d._id)
+    // A message folded into a booking as a duplicate shows that booking's status.
+    const linked = await Booking.find(
+      { $or: [{ rawMessageId: { $in: ids } }, { 'otherSources.rawMessageId': { $in: ids } }] },
+      { rawMessageId: 1, 'otherSources.rawMessageId': 1, status: 1 },
+    ).lean()
+    const statusOf = new Map(linked.flatMap((b) => (b.otherSources ?? []).map((s) => [String(s.rawMessageId), b.status])))
+    for (const b of linked) if (b.rawMessageId) statusOf.set(String(b.rawMessageId), b.status)
     res.json({
       items: docs.map((d) => ({
         id: String(d._id), groupId: d.groupId, groupName: d.groupName, sender: maskSender(d.sender),
@@ -172,7 +197,7 @@ export function createRoutes({ models: { Booking, RawMessage }, config, getHealt
 
   r.get('/health', async (req, res) => {
     const start = istStartOfToday()
-    const { whatsapp, groupNames, lastMessageAt } = getHealthState()
+    const { whatsapp, groupNames, lastMessageAt, heartbeat, outputs } = getHealthState()
     const perGroup = await Promise.all(config.targetGroupIds.map(async (id) => {
       // After a restart the in-memory values are empty; the newest stored message fills them.
       const newest = await RawMessage.findOne({ groupId: id }).sort({ timestamp: -1 }).lean()
@@ -198,10 +223,8 @@ export function createRoutes({ models: { Booking, RawMessage }, config, getHealt
         rawToday, bookingsToday, reviewPending,
         duplicatesToday: withDupes.flatMap((b) => b.otherSources).filter((s) => new Date(s.receivedAt) >= start).length,
       },
-      // TODO(step 9): quiet and lastAlertAt come from the heartbeat job.
-      heartbeat: { minutes: config.heartbeatMinutes, windowStart: '08:00', windowEnd: '23:00', quiet: false, lastAlertAt: null },
-      // TODO(step 7): report which outputs are enabled.
-      outputs: { sheets: false, telegram: false, whatsappSend: false },
+      heartbeat,
+      outputs,
     })
   })
 

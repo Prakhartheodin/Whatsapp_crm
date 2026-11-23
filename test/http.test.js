@@ -4,6 +4,8 @@ import { createHmac } from 'node:crypto'
 import ExcelJS from 'exceljs'
 import { createApp } from '../backend/http/server.js'
 import { hashPassword } from '../backend/auth/password.js'
+import { toBooking } from '../backend/http/routes.js'
+import { Booking } from '../backend/models.js'
 
 // ---- in-memory stand-ins for the Mongoose models (only the calls the routes make) ----
 const get = (o, path) =>
@@ -109,11 +111,24 @@ async function start(t) {
     ]),
   }
   const confirmed = []
+  const ingested = []
   const app = createApp({
     models,
     config: { apiToken: TOKEN, sessionSecret: SECRET, nodeEnv: 'test', targetGroupIds: [GROUP], heartbeatMinutes: 120 },
-    getHealthState: () => ({ whatsapp: { status: 'open', since: new Date(now) }, groupNames: new Map(), lastMessageAt: new Map() }),
+    getHealthState: () => ({
+      whatsapp: { status: 'open', since: new Date(now) }, groupNames: new Map(), lastMessageAt: new Map(),
+      heartbeat: { minutes: 120, windowStart: '08:00', windowEnd: '23:00', quiet: true, lastAlertAt: new Date(now) },
+      outputs: { sheets: true, telegram: false, whatsappSend: false },
+    }),
     onConfirmed: (b) => confirmed.push(b),
+    pipeline: {
+      async processMessage(m) {
+        ingested.push(m)
+        // The real pipeline marks its validation errors like this (status 400, expose).
+        if (m.rawText === 'rejected by pipeline') throw Object.assign(new Error('Pipeline says no.'), { status: 400, expose: true })
+        return INGEST_RESULTS[m.rawText] ?? { status: 'ignored' }
+      },
+    },
     // Any logged error means a route failed (even after it had already answered).
     logger: { error: (o, msg) => errors.push(msg), warn() {}, info() {} },
   })
@@ -131,7 +146,14 @@ async function start(t) {
       body: body === undefined ? undefined : typeof body === 'string' ? body : JSON.stringify(body),
     })
   const login = (username, password) => call('/login', { method: 'POST', body: { username, password }, auth: false })
-  return { models, confirmed, call, login, errors }
+  return { models, confirmed, ingested, call, login, errors }
+}
+
+const INGEST_RESULTS = {
+  confirmed: { status: 'confirmed', bookingId: id(40) },
+  review: { status: 'review', bookingId: id(41) },
+  duplicate: { status: 'duplicate', duplicateOf: id(3) },
+  ignored: { status: 'ignored' },
 }
 
 const signed = (payload, secret = SECRET) => {
@@ -147,7 +169,7 @@ test('every data route needs auth', async (t) => {
     assert.equal(res.status, 401, p)
     assert.equal(typeof (await res.json()).error, 'string')
   }
-  for (const p of [`/api/bookings/${id(1)}/confirm`, '/logout']) {
+  for (const p of [`/api/bookings/${id(1)}/confirm`, '/logout', '/ingest']) {
     assert.equal((await call(p, { method: 'POST', body: {}, auth: false })).status, 401, p)
   }
 })
@@ -346,7 +368,7 @@ test('an undo landing between confirm and the outputs claim does not fire output
 })
 
 test('/api/raw masks senders and reports booking status', async (t) => {
-  const { call } = await start(t)
+  const { call, models } = await start(t)
   const res = await call(`/api/raw?group=${encodeURIComponent(GROUP)}`)
   assert.equal(res.status, 200)
   const text = await res.text()
@@ -358,6 +380,11 @@ test('/api/raw masks senders and reports booking status', async (t) => {
     [id(901), '91xxxxxxxx10', 'review'],
   ])
   assert.deepEqual(Object.keys(body.items[0]).sort(), ['bookingStatus', 'groupId', 'groupName', 'id', 'sender', 'text', 'timestamp'])
+
+  // A message folded into booking 3 as a duplicate reports that booking's status.
+  models.Booking.docs[2].otherSources.push({ source: 'whatsapp:Cabs', rawMessageId: id(902), receivedAt: ago(5) })
+  const again = await (await call(`/api/raw?group=${encodeURIComponent(GROUP)}`)).json()
+  assert.deepEqual(again.items.map((r) => [r.id, r.bookingStatus]), [[id(902), 'confirmed'], [id(901), 'review']])
 })
 
 test('security headers, JSON 404 for unknown /api, non-JSON POST rejected', async (t) => {
@@ -466,6 +493,66 @@ test('/health shape, "today" starts at IST midnight', async (t) => {
   assert.equal(h.lastMessageAt, after.toISOString())
   assert.deepEqual(h.perGroup, [{ id: GROUP, name: 'Cabs', lastMessageAt: after.toISOString(), countToday: 1 }])
   assert.deepEqual(h.counts, { rawToday: 1, bookingsToday: 1, reviewPending: 2, duplicatesToday: 1 })
-  assert.deepEqual(h.heartbeat, { minutes: 120, windowStart: '08:00', windowEnd: '23:00', quiet: false, lastAlertAt: null })
-  assert.deepEqual(h.outputs, { sheets: false, telegram: false, whatsappSend: false })
+  // Injected heartbeat state and outputs status are passed through.
+  assert.deepEqual(h.heartbeat, { minutes: 120, windowStart: '08:00', windowEnd: '23:00', quiet: true, lastAlertAt: new Date(now).toISOString() })
+  assert.deepEqual(h.outputs, { sheets: true, telegram: false, whatsappSend: false })
+})
+
+test('POST /ingest: runs the pipeline and passes its result through', async (t) => {
+  const { call, ingested } = await start(t)
+  const receivedAt = new Date(Date.now() - 3600_000).toISOString()
+  for (const rawText of Object.keys(INGEST_RESULTS)) {
+    const res = await call('/ingest', { method: 'POST', body: { source: 'app', rawText, receivedAt } })
+    assert.equal(res.status, 200, rawText)
+    assert.deepEqual(await res.json(), INGEST_RESULTS[rawText])
+  }
+  assert.equal(ingested.length, 4)
+  assert.deepEqual(ingested[0], { source: 'app', rawText: 'confirmed', receivedAt: new Date(receivedAt) })
+  assert.ok(ingested[0].receivedAt instanceof Date)
+
+  const res = await call('/ingest', { method: 'POST', body: { source: 'app', rawText: 'rejected by pipeline', receivedAt } })
+  assert.equal(res.status, 400)
+  assert.deepEqual(await res.json(), { error: 'Pipeline says no.' })
+})
+
+test('POST /ingest: invalid bodies get 400 and never reach the pipeline', async (t) => {
+  const { call, ingested } = await start(t)
+  const ok = { source: 'app', rawText: 'confirmed', receivedAt: new Date(Date.now() - 60_000).toISOString() }
+  const soon = new Date(Date.now() + 4 * 60_000).toISOString()
+  const late = new Date(Date.now() + 6 * 60_000).toISOString()
+  const stale = new Date(Date.now() - 7 * 86_400_000 - 60_000).toISOString() // older than 7 days
+  for (const patch of [
+    { source: undefined }, { source: '' }, { source: '   ' }, { source: 'x'.repeat(101) }, { source: 5 },
+    { rawText: undefined }, { rawText: '' }, { rawText: '  \n ' }, { rawText: 'x'.repeat(4001) }, { rawText: ['a'] },
+    { receivedAt: undefined }, { receivedAt: '2026-11-23' }, { receivedAt: '2026-11-23T09:15:00' }, { receivedAt: 'yesterday' },
+    { receivedAt: '2026-02-30T09:15:00Z' }, { receivedAt: '2026-11-23T25:00:00Z' }, { receivedAt: 1732350000000 }, { receivedAt: late }, { receivedAt: stale },
+  ]) {
+    const res = await call('/ingest', { method: 'POST', body: { ...ok, ...patch } })
+    assert.equal(res.status, 400, JSON.stringify(patch).slice(0, 80))
+    assert.equal(typeof (await res.json()).error, 'string')
+  }
+  for (const body of ['[]', 'null', '"text"']) {
+    assert.equal((await call('/ingest', { method: 'POST', body })).status, 400, body)
+  }
+  assert.equal(ingested.length, 0)
+  // Edge of the limits is fine: 100-char source, 4000-char text, 4 minutes ahead (clock skew).
+  for (const body of [{ ...ok, source: 's'.repeat(100), rawText: 'x'.repeat(4000) }, { ...ok, receivedAt: soon }]) {
+    assert.equal((await call('/ingest', { method: 'POST', body })).status, 200)
+  }
+})
+
+test('POST /ingest: JSON only', async (t) => {
+  const { call, ingested } = await start(t)
+  const res = await call('/ingest', { method: 'POST', body: 'source=app&rawText=hi', headers: { 'content-type': 'application/x-www-form-urlencoded' } })
+  assert.equal(res.status, 415)
+  assert.equal((await call('/ingest', { method: 'POST' })).status, 415) // no body, no content type
+  assert.equal(ingested.length, 0)
+})
+
+test('toBooking gives outputs the same shape from a Mongoose document as from a lean row', () => {
+  const doc = new Booking({ ...booking(50, 'confirmed', 'rules', { _id: undefined }), otherSources: [{ source: 'app', rawMessageId: id(7), receivedAt: ago(1) }] })
+  const fromDoc = toBooking(doc)
+  assert.deepEqual(fromDoc, toBooking(doc.toObject()))
+  assert.equal(fromDoc.id, String(doc._id))
+  assert.deepEqual(fromDoc.otherSources, [{ source: 'app', receivedAt: ago(1) }])
 })

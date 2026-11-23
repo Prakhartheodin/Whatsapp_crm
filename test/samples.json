@@ -1,0 +1,181 @@
+[
+  {
+    "id": "s1",
+    "note": "PLACEHOLDER, invented (no real samples yet): English booking with labelled pickup/drop.",
+    "text": "Booking: Pickup Delhi Airport T3, drop Agra. Tomorrow 6 am, Sedan, fare 3500. Call 98765 43210",
+    "receivedAt": "2026-11-20T09:15:00+05:30",
+    "expected": {
+      "isBooking": true,
+      "pickup": "Delhi Airport T3",
+      "drop": "Agra",
+      "tripDateTime": "2026-11-21T06:00:00+05:30",
+      "carType": "Sedan",
+      "fare": 3500,
+      "contact": "9876543210"
+    },
+    "duplicateOf": null
+  },
+  {
+    "id": "s2",
+    "note": "PLACEHOLDER, invented: Hindi in Latin script, 'kal subah 7 baje', 'X se Y'.",
+    "text": "Gadi chahiye kal subah 7 baje, Jaipur se Ajmer, Ertiga, 2800 rupay, sampark 9812345678",
+    "receivedAt": "2026-11-20T18:40:00+05:30",
+    "expected": {
+      "isBooking": true,
+      "pickup": "Jaipur",
+      "drop": "Ajmer",
+      "tripDateTime": "2026-11-21T07:00:00+05:30",
+      "carType": "Ertiga",
+      "fare": 2800,
+      "contact": "9812345678"
+    },
+    "duplicateOf": null
+  },
+  {
+    "id": "s3",
+    "note": "PLACEHOLDER, invented: Hinglish, 'from X to Y', +91 spaced number, rupee sign.",
+    "text": "Urgent cab required from Noida Sector 62 to Gurgaon Cyber City, aaj 5:30 pm, Innova, ₹2200. Contact +91 99887 76655",
+    "receivedAt": "2026-11-20T14:00:00+05:30",
+    "expected": {
+      "isBooking": true,
+      "pickup": "Noida Sector 62",
+      "drop": "Gurgaon Cyber City",
+      "tripDateTime": "2026-11-20T17:30:00+05:30",
+      "carType": "Innova",
+      "fare": 2200,
+      "contact": "9988776655"
+    },
+    "duplicateOf": null
+  },
+  {
+    "id": "s4",
+    "note": "PLACEHOLDER, invented: driver-availability post (a free car offered, not a booking).",
+    "text": "Sedan available for Delhi to Chandigarh tomorrow, return empty car, call 9876501234",
+    "receivedAt": "2026-11-20T08:00:00+05:30",
+    "expected": { "isBooking": false },
+    "duplicateOf": null
+  },
+  {
+    "id": "s5",
+    "note": "PLACEHOLDER, invented: ordinary chat that mentions a day and a time.",
+    "text": "Good morning everyone, kal meeting 10 baje hai",
+    "receivedAt": "2026-11-20T07:30:00+05:30",
+    "expected": { "isBooking": false },
+    "duplicateOf": null
+  },
+  {
+    "id": "s6",
+    "note": "PLACEHOLDER, invented: booking without a fare.",
+    "text": "Need Dzire from Lucknow to Kanpur tomorrow 9 am. 9123456780",
+    "receivedAt": "2026-11-20T21:00:00+05:30",
+    "expected": {
+      "isBooking": true,
+      "pickup": "Lucknow",
+      "drop": "Kanpur",
+      "tripDateTime": "2026-11-21T09:00:00+05:30",
+      "carType": "Dzire",
+      "fare": null,
+      "contact": "9123456780"
+    },
+    "duplicateOf": null
+  },
+  {
+    "id": "s7",
+    "note": "PLACEHOLDER, invented: first copy of a booking posted twice (see s8).",
+    "text": "Pickup: Connaught Place, Drop: IGI Airport T3, 21/11 at 4:00 am, Etios, Rs 900, ph 98100 12345",
+    "receivedAt": "2026-11-20T10:00:00+05:30",
+    "expected": {
+      "isBooking": true,
+      "pickup": "Connaught Place",
+      "drop": "IGI Airport T3",
+      "tripDateTime": "2026-11-21T04:00:00+05:30",
+      "carType": "Etios",
+      "fare": 900,
+      "contact": "9810012345"
+    },
+    "duplicateOf": null
+  },
+  {
+    "id": "s8",
+    "note": "PLACEHOLDER, invented: s7 reposted in another group, worded differently in Hinglish, with a typo.",
+    "text": "Cab chahiye Conaught Place se IGI airport T3, 21 Nov subah 4 baje, Etios, 900 rupay. 98100-12345",
+    "receivedAt": "2026-11-20T10:20:00+05:30",
+    "expected": {
+      "isBooking": true,
+      "pickup": "Conaught Place",
+      "drop": "IGI airport T3",
+      "tripDateTime": "2026-11-21T04:00:00+05:30",
+      "fare": 900,
+      "contact": "9810012345"
+    },
+    "duplicateOf": "s7"
+  },
+  {
+    "id": "s9",
+    "note": "PLACEHOLDER, invented: '8 baje' without morning/evening is ambiguous, so no trip time is guessed.",
+    "text": "Innova Crysta chahiye Chandigarh se Shimla, parso 8 baje, 9000 rupay, 9988001122",
+    "receivedAt": "2026-11-20T12:00:00+05:30",
+    "expected": {
+      "isBooking": true,
+      "pickup": "Chandigarh",
+      "drop": "Shimla",
+      "tripDateTime": null,
+      "carType": "Innova Crysta",
+      "fare": 9000,
+      "contact": "9988001122"
+    },
+    "duplicateOf": null
+  },
+  {
+    "id": "s10",
+    "note": "PLACEHOLDER, invented: ordinary chat.",
+    "text": "Thanks bhai, payment received. See you tomorrow",
+    "receivedAt": "2026-11-20T19:00:00+05:30",
+    "expected": { "isBooking": false },
+    "duplicateOf": null
+  },
+  {
+    "id": "s11",
+    "note": "PLACEHOLDER, invented: a customer asking whether a car is 'available' is still a booking request.",
+    "text": "Koi gadi available hai kya? Delhi to Agra kal 6 am, 9876543210",
+    "receivedAt": "2026-11-20T10:00:00+05:30",
+    "expected": {
+      "isBooking": true,
+      "pickup": "Delhi",
+      "drop": "Agra",
+      "tripDateTime": "2026-11-21T06:00:00+05:30",
+      "contact": "9876543210"
+    },
+    "duplicateOf": null
+  },
+  {
+    "id": "s12",
+    "note": "PLACEHOLDER, invented: a terse Hinglish request with no route, time or number.",
+    "text": "Cab chahiye airport",
+    "receivedAt": "2026-11-20T11:00:00+05:30",
+    "expected": { "isBooking": true, "contact": null, "tripDateTime": null },
+    "duplicateOf": null
+  },
+  {
+    "id": "s13",
+    "note": "PLACEHOLDER, invented: two phone numbers, so no single contact.",
+    "text": "Delhi to Jaipur kal 6 am Sedan 9876543210 / 9812345678",
+    "receivedAt": "2026-11-20T12:00:00+05:30",
+    "expected": {
+      "isBooking": true,
+      "pickup": "Delhi",
+      "drop": "Jaipur",
+      "carType": "Sedan",
+      "contact": null
+    },
+    "duplicateOf": null
+  },
+  {
+    "id": "s14",
+    "note": "PLACEHOLDER, invented: s13 forwarded unchanged to another group; folds in by identical text.",
+    "text": "Delhi to Jaipur  kal 6 am Sedan 9876543210 / 9812345678",
+    "receivedAt": "2026-11-20T12:03:00+05:30",
+    "expected": { "isBooking": true, "contact": null },
+    "duplicateOf": "s13"
+  }
+]

@@ -38,6 +38,17 @@ export function nextStep(code, attempt, rand = Math.random()) {
 
 let attempt = 0
 let stableTimer
+let currentSock
+
+/** The newest socket (for whatsapp/send.js, which checks that it is open). */
+export const getSock = () => currentSock
+
+let closing = false
+/** Shutdown: closes the socket without reconnecting. Not a logout: the device stays linked. */
+export function closeWhatsApp() {
+  closing = true
+  currentSock?.end(undefined)
+}
 
 // Credential writes in flight; flushCreds() lets callers wait for them before process.exit.
 const pending = new Set()
@@ -82,14 +93,14 @@ async function backupCreds() {
 
 function stop(status, handlers, details = {}, message = STOP_HELP[status]) {
   setStatus(status)
-  // TODO(step 7): also send this as a Telegram alert.
   logger.fatal({ ...details, status }, message)
   handlers.onStop?.(status)
 }
 
 /**
  * @param {{ onSocket?: (sock) => void, onOpen?: (sock) => void, onStop?: (status: string) => void }} handlers
- * onSocket runs for every new socket (attach event listeners there).
+ * onSocket runs for every new socket (attach event listeners there). onStop runs once per stop status
+ * (index.js runs the heartbeat check there, which sends the Telegram alert).
  */
 export async function startWhatsApp(handlers = {}) {
   if (!(await prepareAuthDir())) {
@@ -105,6 +116,7 @@ export async function startWhatsApp(handlers = {}) {
     // Baileys needs it for sender-ID mappings and warns of session errors without it.
     syncFullHistory: false,
   })
+  currentSock = sock
   let pairingRequested = false
   let stopped = false
 
@@ -151,7 +163,7 @@ export async function startWhatsApp(handlers = {}) {
 
     if (connection === 'close') {
       clearTimeout(stableTimer)
-      if (stopped) return
+      if (stopped || closing) return
       const code = lastDisconnect?.error?.output?.statusCode
       const step = nextStep(code, attempt)
       if (step.stop) return stop(step.stop, handlers, { code })
@@ -166,6 +178,7 @@ export async function startWhatsApp(handlers = {}) {
 }
 
 function reconnect(handlers) {
+  if (closing) return
   startWhatsApp(handlers).catch((err) => {
     logger.error({ err }, 'whatsapp reconnect failed')
     const step = nextStep(undefined, attempt)
