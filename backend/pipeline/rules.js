@@ -121,6 +121,15 @@ export const PLACE_MAX_WORDS = 6
 // or one of these words continues across that one comma ("Sector 62, Noida", "Block C, Vasant Kunj").
 export const LOCALITY_WORDS = [...ADDRESS_WORDS, 'phase', 'terminal', 'tower', 'pocket', 'wing', 'floor']
 export const SUB_LOCALITY = new RegExp(`\\p{N}|${anyWord(LOCALITY_WORDS).source}`, 'iu')
+// TODO(samples): words about the trip, not the place. Stripped from the END of a pickup or drop ("Jaipur one
+// way" -> "Jaipur"), never when they are the whole place; a continuation after a sub-locality comma made only
+// of these is dropped ("Sector 62, one way" -> "Sector 62").
+export const TRIP_QUALIFIER_WORDS = ['one way', 'oneway', 'round trip', 'return', 'urgent', 'asap', 'ac', 'non ac',
+  'toll', 'parking', 'extra', 'fixed', 'negotiable', 'only', 'cash', 'advance', 'sharing', 'luggage', 'drop only',
+  'pickup only']
+// One or more qualifiers (each after a space or comma) up to the end. Applied only to places already capped at
+// FIELD_MAX_CHARS, so the repetition stays cheap.
+export const TRAILING_QUALIFIERS = new RegExp(`(?:[\\s,]+(?:${alt(TRIP_QUALIFIER_WORDS)})(?![\\p{L}\\p{N}]))+[\\s,]*$`, 'iu')
 
 // TODO(samples): words dropped when normalising places for de-duplication.
 export const FILLER_WORDS = ['near', 'opp', 'opposite', 'the', 'ke', 'paas', 'pass', 'ki', 'ka', 'side', 'area']

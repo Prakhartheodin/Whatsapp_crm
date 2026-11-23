@@ -76,6 +76,11 @@ export function fakeModel(docs = [], { unique } = {}) {
       if (d) apply(d, u)
       return { matchedCount: d ? 1 : 0, modifiedCount: d ? 1 : 0 }
     },
+    async updateMany(f, u) {
+      const hit = docs.filter((x) => match(x, f))
+      for (const d of hit) apply(d, u)
+      return { matchedCount: hit.length, modifiedCount: hit.length }
+    },
     async create(doc) {
       if (unique && docs.some((d) => unique.every((k) => String(d[k]) === String(doc[k])))) {
         throw Object.assign(new Error('E11000 duplicate key'), { code: 11000 })

@@ -55,6 +55,12 @@ const bookingSchema = new mongoose.Schema(
     delivered: { telegram: { type: Date, default: null }, sheets: { type: Date, default: null }, whatsappSend: { type: Date, default: null } },
     givenUp: { telegram: { type: Date, default: null }, sheets: { type: Date, default: null }, whatsappSend: { type: Date, default: null } },
     outputAttempts: { type: Number, default: 0 },
+    lastAttemptAt: { type: Date, default: null },
+    // Outputs enabled when the booking was claimed: the only ones it is ever sent to.
+    wanted: { type: [String], default: undefined },
+    // Write-ahead marker per output, set before a send and cleared with its result: set without a
+    // delivery = unknown outcome, so the next copy is labelled as a possible repeat.
+    sending: { telegram: { type: Date, default: null }, sheets: { type: Date, default: null }, whatsappSend: { type: Date, default: null } },
   },
   { collection: 'bookings' },
 )

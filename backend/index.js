@@ -75,7 +75,12 @@ const recover = () => replaySpool().then(() => feedUnprocessed())
 recover()
 for (const ev of ['connected', 'reconnected']) mongoose.connection.on(ev, recover)
 await seedGroupNames()
-await releaseIngestKeys(IngestKey) // /ingest keys orphaned by the last stop; else their retries get 409 for 7 days
+try {
+  await releaseIngestKeys(IngestKey) // /ingest keys orphaned by the last stop; else their retries get 409 for 7 days
+} catch (err) {
+  logger.fatal(`MongoDB error while freeing /ingest keys at start (${err.name}). Check MongoDB and restart.`)
+  process.exit(1)
+}
 
 // HTTP first and independent of WhatsApp: if the session stops, the dashboard still shows why.
 const app = createApp({

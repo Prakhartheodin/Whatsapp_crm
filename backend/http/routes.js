@@ -70,9 +70,10 @@ export const toBooking = (d) => ({
 const maskSender = (s) => (!s || s === 'me' ? s : maskPhone(s.split(/[:@]/)[0]))
 
 const INGEST_PER_MINUTE = 60
-const INGEST_KEY_STALE_MS = 10 * 60_000 // a key still without a result after this belongs to a dead request
-
-/** At start, before HTTP listens: one process, so a key without a result is an orphan of a request that died. */
+/**
+ * At start, before HTTP listens: one process, so a key without a result is an orphan of a request
+ * that died with the previous process. After this, a key without a result is a request still running.
+ */
 export const releaseIngestKeys = (IngestKey) => IngestKey.deleteMany({ result: null })
 const MAX_TRACKED = 10_000
 
@@ -178,19 +179,13 @@ export function createRoutes({ models: { Booking, RawMessage, IngestKey }, confi
     // Requests without clientMessageId are not idempotent.
     const key = clientMessageId && { source: source.trim().toLowerCase(), clientMessageId }
     if (key) {
-      for (let attempt = 0; ; attempt++) {
-        try {
-          await IngestKey.create(key)
-          break
-        } catch (err) {
-          if (err.code !== 11000) throw err
-          const prev = await IngestKey.findOne(key).lean()
-          if (prev?.result) return res.json(prev.result)
-          // A key left without a result for 10 min belongs to a request that died: take it over (atomically).
-          const freed = !attempt && (await IngestKey.deleteOne({ ...key, result: null,
-            createdAt: { $lt: new Date(Date.now() - INGEST_KEY_STALE_MS) } })).deletedCount === 1
-          if (!freed) return res.status(409).json({ error: 'This message is still being processed. Retry shortly.' })
-        }
+      try {
+        await IngestKey.create(key)
+      } catch (err) {
+        if (err.code !== 11000) throw err
+        const prev = await IngestKey.findOne(key).lean()
+        if (prev?.result) return res.json(prev.result)
+        return res.status(409).json({ error: 'This message is still being processed. Retry shortly.' })
       }
     }
     let result
@@ -201,7 +196,13 @@ export function createRoutes({ models: { Booking, RawMessage, IngestKey }, confi
       if (key) await IngestKey.deleteOne(key).catch(() => {}) // not processed: a retry must run again
       throw err
     }
-    if (key) await IngestKey.updateOne(key, { $set: { result } })
+    if (key) {
+      await IngestKey.updateOne(key, { $set: { result } }).catch((err) => {
+        // Never leave a key without a result (its retries would get 409 until a restart).
+        logger.error({ err }, 'could not store the /ingest result; key freed')
+        return IngestKey.deleteOne(key).catch(() => {})
+      })
+    }
     res.json(result)
   })
 

@@ -509,7 +509,7 @@ test('POST /ingest: 60 per rolling minute per credential and IP, then 429 with r
 })
 
 test('POST /ingest: a repeated source + clientMessageId returns the first result without running the pipeline', async (t) => {
-  const { call, ingested, models } = await start(t)
+  const { call, ingested, models, errors } = await start(t)
   const body = { source: 'app', rawText: 'confirmed', receivedAt: new Date().toISOString(), clientMessageId: 'msg-1' }
   const first = await (await call('/ingest', { method: 'POST', body })).json()
   assert.deepEqual(first, INGEST_RESULTS.confirmed)
@@ -532,14 +532,21 @@ test('POST /ingest: a repeated source + clientMessageId returns the first result
   // A repeat while the first is still being processed is told to retry.
   models.IngestKey.docs.push({ source: 'app', clientMessageId: 'busy', result: null, createdAt: ago(1) })
   assert.equal((await call('/ingest', { method: 'POST', body: { ...body, clientMessageId: 'busy' } })).status, 409)
-  // ...but a key left without a result for over 10 minutes (its request died) is taken over.
-  models.IngestKey.docs.push({ source: 'app', clientMessageId: 'orphan', result: null, createdAt: ago(11) })
+  // Keys without a result can only belong to this process (the start frees the previous process's),
+  // so even an old one is a request still running (e.g. queued behind a slow LLM): never taken over.
+  models.IngestKey.docs.push({ source: 'app', clientMessageId: 'slow', result: null, createdAt: ago(30) })
   const before = ingested.length
-  const took = await call('/ingest', { method: 'POST', body: { ...body, clientMessageId: 'orphan' } })
-  assert.equal(took.status, 200)
-  assert.deepEqual(await took.json(), INGEST_RESULTS.confirmed)
-  assert.equal(ingested.length, before + 1)
-  assert.deepEqual(models.IngestKey.docs.filter((d) => d.clientMessageId === 'orphan').map((d) => d.result), [INGEST_RESULTS.confirmed])
+  assert.equal((await call('/ingest', { method: 'POST', body: { ...body, clientMessageId: 'slow' } })).status, 409)
+  assert.equal(ingested.length, before)
+  // If storing the result fails, the key is freed (a retry runs again; de-duplication folds the copy).
+  const updateOne = models.IngestKey.updateOne
+  models.IngestKey.updateOne = async () => { throw new Error('mongo blip') }
+  const stored = await call('/ingest', { method: 'POST', body: { ...body, clientMessageId: 'unsaved' } })
+  models.IngestKey.updateOne = updateOne
+  assert.equal(stored.status, 200)
+  assert.deepEqual(await stored.json(), INGEST_RESULTS.confirmed)
+  assert.equal(models.IngestKey.docs.some((d) => d.clientMessageId === 'unsaved'), false)
+  assert.deepEqual(errors.splice(0), ['could not store the /ingest result; key freed'])
   // The key's source is case- and space-insensitive (the booking keeps the source as sent).
   const n = ingested.length
   const same = await call('/ingest', { method: 'POST', body: { ...body, source: ' APP ' } })

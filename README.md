@@ -166,7 +166,7 @@ body. The text is kept on the booking only, not in raw messages.
   sets it to a stable id per message. A repeat of the same `source` (case and surrounding spaces
   ignored) + `clientMessageId` within 7 days returns the first answer without running the pipeline
   again (`409` while the first is still being processed: retry shortly). An id whose request died
-  (service restart, error) is freed at the next start, or after 10 minutes. A request without
+  (service restart) is freed at the next start; one whose result could not be stored is freed at once. A request without
   `clientMessageId` is not idempotent: sending it twice processes it twice (de-duplication may
   still fold the copy).
 - Rate limit: 60 requests per rolling minute per credential (API token or login) and client IP;
@@ -195,24 +195,28 @@ Details and response shapes are in [design.md](design.md) section 8.
 
 ## Outputs
 
-Each confirmed booking (confirmed by the rules, the LLM, or you in Review) is sent to every
-enabled output. Review items are not sent. One output failing is logged and does not stop the
-others. Each booking records, per output, when that output got it (as soon as that output is
-done, not after the slowest one), so each output gets a booking at most once, except after a crash
-in the instant between sending and recording it.
+Each confirmed booking (confirmed by the rules, the LLM, or you in Review) is sent to the outputs
+that were enabled when it was confirmed. Review items are not sent. One output failing is logged
+and does not stop the others.
 
-Retries: every 2 minutes (and at start) the service re-sends, per booking, only the enabled
-outputs that have not got it yet. That covers a failed send and a crash or restart between
-confirming and sending. Limits:
+**The guarantee.** Every enabled output gets every confirmed booking, or, after 7 days of
+failing, the booking is marked as failed for that output: logged once and counted on the Status
+screen (`/health` `counts.outputsFailed`). It is never dropped silently. A second copy can only
+happen when the outcome of a send is genuinely unknown (a timeout, or a crash between sending and
+recording it). Google Sheets then finds its own row and adds no second one. Telegram and WhatsApp
+cannot be asked, so they send the copy with the first line "Possible repeat (delivery of the first
+copy could not be confirmed)".
 
-- At most 5 attempts per booking; then one `error` log line names the booking and the outputs that
-  failed, and it is shown as failed on the Status screen (`/health` `counts.outputsFailed`).
-  Bookings still being retried are `counts.outputsPending`.
-- Only bookings confirmed in the last 24 hours are retried. Turning an output on later also sends
-  it the bookings confirmed in the last 24 hours that it never got.
-- Google Sheets is retried only when Google answered with an error (nothing was written). After a
-  timeout or network error the row may have been written, so that booking's Sheets row is given up
-  (logged, counted as failed) rather than risk a duplicate. Telegram and WhatsApp send are retried.
+How: before each send the booking is marked "sending" for that output; the result is recorded as
+soon as that output finishes (retried a few times if MongoDB blips). A mark with no result means
+the outcome is unknown. Retries:
+
+- every 2 minutes for the first 5 attempts, then hourly, until delivered or 7 days old. One
+  `error` log line at the switch to hourly, one when given up. Bookings still being retried are
+  `counts.outputsPending`.
+- only the outputs that have not got the booking yet, and only those enabled when it was confirmed:
+  turning an output on later does not send it older bookings.
+- a send that failed cleanly (the service answered with an error) is retried without the label.
 - Undo (back to Review) stops the retries; confirming again sends only what is still missing.
 - WhatsApp retries go through the same sender queue and limits as first sends.
 
@@ -221,8 +225,8 @@ bot a message (or add it to a group and post there), open
 `https://api.telegram.org/bot<token>/getUpdates` in a browser and copy `chat.id` into
 `TELEGRAM_CHAT_ID`. Set `TELEGRAM_ENABLED=true`. Telegram also gets the heartbeat alerts.
 
-**Google Sheets** (one row per booking: received, trip time, pickup, drop, car, fare, contact,
-source, confidence, original message):
+**Google Sheets** (one row per booking, columns A-K: received, trip time, pickup, drop, car, fare,
+contact, source, confidence, original message, Booking ID):
 
 1. In Google Cloud Console create a project and enable the **Google Sheets API**.
 2. IAM & Admin > Service accounts > create one (no roles needed) > Keys > Add key > JSON.
@@ -235,12 +239,20 @@ source, confidence, original message):
 
 Values are written as plain text, so a message starting with `=` is never run as a formula.
 
+Column K (Booking ID) is how a retry recognises a row it already wrote: before any retry the service
+reads column K of the tab (one request; about 25 bytes per row, so 10 000 rows is about 250 kB).
+Keep column K for the booking ids and do not sort or edit it. A new, empty sheet needs nothing; add
+headers in row 1 if you like (`Booking ID` in K1). A sheet that already holds rows in the old
+10-column layout keeps working: the old rows simply have an empty K. Do not put anything else in
+column K.
+
 **WhatsApp send** (`WHATSAPP_SEND_ENABLED`, default `false`). Sending from the linked number is
 the main ban risk; leave it off unless you need it. When on, it sends the booking alert only to
 `TARGET_NUMBER` (the code cannot send anywhere else), waits a random 3-8 s before each message,
 sends at most 10 per minute, queues up to 100 more (extras are dropped with a warning) and skips
 a message while the session is not connected. The queue is in memory: a restart drops it (the
-count is logged) and the retries above send those messages again. The target number is logged,
+count is logged) and the retries above send those messages again, labelled as a possible repeat
+(the service cannot tell whether a queued message had already gone out). The target number is logged,
 masked, at start.
 
 ## Booking detection and samples
@@ -470,13 +482,15 @@ link, then start pm2 again.
   drop that batch. The window is short; it is library behaviour.
 - A message that cannot be decrypted is logged as a warning (`no readable content`) with its group
   and message ID. WhatsApp usually resends it; if not, it is missing.
-- Output retries stop after 5 attempts or 24 hours; a Sheets row whose write timed out is not
-  retried (see [Outputs](#outputs)).
+- Telegram and WhatsApp can show one labelled "Possible repeat" copy after a timeout or a crash at
+  the wrong moment (see [Outputs](#outputs)). An output still failing after 7 days is given up and
+  counted as failed. Bookings confirmed before delivery tracking existed (no record of which outputs
+  were enabled) are not retried.
 - A stored message that did not finish the booking pipeline (restart, MongoDB error) is fed again
   at the next start or MongoDB reconnect, but only for 48 hours; older ones stay in Raw messages only.
 - Messages longer than 4000 characters are classified from their first 4000 (the full text stays in
   Raw messages). A group name longer than 91 characters is cut in the booking source.
 - The WhatsApp send queue and the pipeline queue live in memory; both are recovered after a restart
   (outbox retries, pipeline re-feed) within the limits above. Only the outputs not yet recorded as
-  delivered are sent again.
+  delivered are sent again; a WhatsApp message that was waiting in the queue comes labelled.
 - The `/ingest` rate limit is per process and in memory (a restart resets it).

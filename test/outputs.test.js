@@ -87,12 +87,13 @@ test('telegram: 500 then 500 returns false; 400 is not retried; never throws', a
   assert.equal(fetch2.calls.length, 1)
 
   const netErr = () => new TypeError(`fetch failed https://api.telegram.org/bot${TOKEN}/sendMessage`)
-  const fetch3 = fakeFetch(netErr(), netErr())
-  assert.equal(await createTelegram(tgConfig, { fetch: fetch3, logger, sleep: noSleep() }).send('x'), false)
-  assert.equal(fetch3.calls.length, 2, 'network error / timeout retried once')
+  // A network error or timeout may have delivered the message: reported as unknown, never retried here
+  // (the outbox retries it later, labelled as a possible repeat).
+  const fetch3 = fakeFetch(netErr())
+  assert.equal(await createTelegram(tgConfig, { fetch: fetch3, logger, sleep: noSleep() }).send('x'), 'unknown')
+  assert.equal(fetch3.calls.length, 1)
   const timeout = Object.assign(new Error('timed out'), { name: 'TimeoutError' })
-  const fetch4 = fakeFetch(timeout, json({ ok: true }))
-  assert.equal(await createTelegram(tgConfig, { fetch: fetch4, logger, sleep: noSleep() }).send('x'), true)
+  assert.equal(await createTelegram(tgConfig, { fetch: fakeFetch(timeout), logger, sleep: noSleep() }).send('x'), 'unknown')
 
   assert.ok(logger.lines.some((l) => l.level === 'error'))
   assert.ok(!logger.text().includes(TOKEN), 'token must never be logged')
@@ -154,7 +155,7 @@ test('sheets: signed JWT, cached token, RAW append with formula text kept as a s
   assert.equal(url, 'https://sheets.googleapis.com/v4/spreadsheets/SHEET%2FID/values/Sheet1!A1:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS')
   assert.equal(init.headers.authorization, 'Bearer ya29.tok')
   assert.deepEqual(JSON.parse(init.body).values, [[
-    '2026-01-01 08:30', '2026-01-01 10:00', 'Delhi', 'Agra', 'sedan', 2500, '919876543210', 'Group A', 0.9, '=HYPERLINK("http://evil")',
+    '2026-01-01 08:30', '2026-01-01 10:00', 'Delhi', 'Agra', 'sedan', 2500, '919876543210', 'Group A', 0.9, '=HYPERLINK("http://evil")', 'b1',
   ]])
 
   clock += 30 * 60_000
@@ -268,4 +269,54 @@ test('outputs: only sends the named outputs; an unknown Sheets outcome is passed
   assert.deepEqual(await outputs.onConfirmed(booking, { only: ['telegram'] }), { telegram: true, sheets: null, whatsappSend: null })
   assert.deepEqual(sent, ['t'])
   assert.deepEqual(await outputs.onConfirmed(booking), { telegram: true, sheets: 'unknown', whatsappSend: true })
+})
+
+test('sheets: every row carries the booking id in column K', async () => {
+  const { config } = await sheetsSetup()
+  const f = fakeFetch(() => json({ access_token: 't', expires_in: 3600 }), json({}))
+  assert.equal(await createSheets(config, { fetch: f, logger: fakeLogger(), sleep: noSleep() }).append({ ...booking, id: 'abc123' }), true)
+  const row = JSON.parse(f.calls[1].init.body).values[0]
+  assert.equal(row.length, 11)
+  assert.equal(row[10], 'abc123')
+})
+
+test('sheets: a retry (check) reads the Booking ID column first and never appends a row that is already there', async () => {
+  const { config } = await sheetsSetup()
+  const token = () => json({ access_token: 't', expires_in: 3600 })
+  const b = { ...booking, id: 'b42' }
+  // Timeout on the first try, then the retry finds the row: delivered, no second append.
+  const f1 = fakeFetch(token, new TypeError('fetch failed'), json({ values: [['', 'b41', 'b42']] }))
+  const sheets = createSheets(config, { fetch: f1, logger: fakeLogger(), sleep: noSleep() })
+  assert.equal(await sheets.append(b), 'unknown')
+  assert.equal(await sheets.append(b, { check: true }), true)
+  assert.equal(f1.calls.length, 3)
+  assert.equal(f1.calls[2].init.method, undefined, 'a read, not an append')
+  assert.match(f1.calls[2].url, /\/values\/Sheet1!K%3AK\?majorDimension=COLUMNS$/)
+  // Not there: appended exactly once.
+  const f2 = fakeFetch(token, json({ values: [['b1']] }), json({}))
+  assert.equal(await createSheets(config, { fetch: f2, logger: fakeLogger(), sleep: noSleep() }).append(b, { check: true }), true)
+  assert.equal(f2.calls.filter((c) => c.init.method === 'POST' && c.url.includes(':append')).length, 1)
+  // An empty sheet (no values) appends; a failed read appends nothing and reports a clean failure.
+  const f3 = fakeFetch(token, json({}), json({}))
+  assert.equal(await createSheets(config, { fetch: f3, logger: fakeLogger(), sleep: noSleep() }).append(b, { check: true }), true)
+  const f4 = fakeFetch(token, json({ error: {} }, 403))
+  assert.equal(await createSheets(config, { fetch: f4, logger: fakeLogger(), sleep: noSleep() }).append(b, { check: true }), false)
+  assert.equal(f4.calls.length, 2)
+})
+
+test('outputs: a possible repeat is labelled on Telegram and WhatsApp; Sheets gets the check flag', async () => {
+  const got = {}
+  const outputs = createOutputs({
+    telegram: { enabled: true, send: async (t) => { got.telegram = t; return true } },
+    sheets: { enabled: true, append: async (b, o) => { got.sheets = o; return true } },
+    sender: { enabled: true, send: async (t) => { got.whatsapp = t; return 'unknown' } },
+    logger: fakeLogger(),
+  })
+  assert.deepEqual(await outputs.onConfirmed(booking, { repeat: true, check: true }), { telegram: true, sheets: true, whatsappSend: 'unknown' })
+  assert.equal(got.telegram, 'Possible repeat (delivery of the first copy could not be confirmed)\n' + formatAlert(booking))
+  assert.equal(got.whatsapp, got.telegram)
+  assert.deepEqual(got.sheets, { check: true })
+  await outputs.onConfirmed(booking)
+  assert.equal(got.telegram, formatAlert(booking), 'no label by default')
+  assert.deepEqual(got.sheets, { check: false })
 })

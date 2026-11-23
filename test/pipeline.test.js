@@ -315,6 +315,9 @@ test('pipeline: a copy with a trailing clause after the drop is the same booking
     ['Delhi to Agra kal 6 am Sedan 9876543210', 'Delhi to Agra, one way, kal 6 am, Sedan, 9876543210'],
     ['Gurgaon se Jaipur kal 6 am Dzire 9876543210', 'Gurgaon se Jaipur, one way, Dzire, kal 6 am, 9876543210'],
     ['Delhi to Agra kal 6 am Sedan 9876543210', 'Delhi to Agra, AC car, kal 6 am, Sedan, 9876543210'],
+    ['Delhi to Sector 62 kal 6 am Sedan 9876543210', 'Delhi to Sector 62, one way, kal 6 am, Sedan, 9876543210'],
+    ['Gurgaon to Terminal 3 5 am Sedan 9876543210', 'Gurgaon to Terminal 3, urgent, 5 am Sedan 9876543210'],
+    ['Delhi to Jaipur kal 7 am Sedan 9876543210', 'Delhi to Jaipur one way kal 7 am Sedan 9876543210'],
   ]) {
     const { r1, r2, rows, sent } = await pair(a, b)
     assert.equal(r1.status, 'confirmed', a)
@@ -334,6 +337,7 @@ test('pipeline: adversarial 4000-character messages are processed fast (no regex
     'commas': ', '.repeat(N / 2), 'word commas': 'Noida, '.repeat(N / 7), 'emoji': '🚕'.repeat(N / 2),
     'spaces': 'a' + ' '.repeat(N - 2) + 'b', 'pickup x570': 'pickup '.repeat(570), 'drop to x500': 'drop to '.repeat(500),
     'fare list': 'fare ' + '1000 '.repeat(799), 'per km': '12 '.repeat(1333) + '/km', 'flat x800': 'flat '.repeat(800) + '12/3',
+    'qualifiers': 'Delhi to Jaipur' + ' one way'.repeat(1000), 'qualifier commas': 'Delhi to Sector 62' + ', one way'.repeat(800),
     'mixed': ('Delhi to Agra, kal 6 am, Sedan, Rs 2500, 9876543210\n').repeat(80),
   }
   extract('warm up Delhi to Agra kal 6 am', T)

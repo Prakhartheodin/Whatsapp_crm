@@ -149,6 +149,23 @@ test('extractor: a comma ends the drop unless the part before it is a sub-locali
   assert.deepEqual([e('Delhi\nto\nAgra').pickup, e('Delhi\nto\nAgra').drop], ['Delhi', 'Agra'])
 })
 
+test('extractor: trip qualifiers ("one way", "urgent", "AC") are not part of a place', () => {
+  const e = (t) => extract(t, at('2026-11-20T10:00:00+05:30'))
+  const drop = (t) => e(t).drop
+  assert.equal(drop('Delhi to Sector 62, one way'), 'Sector 62') // not a sub-locality continuation
+  assert.equal(drop('Delhi to Terminal 3, urgent'), 'Terminal 3')
+  assert.equal(drop('Delhi to Jaipur one way'), 'Jaipur') // trailing, no comma
+  assert.equal(drop('Delhi to Jaipur one way, round trip, kal 7 am'), 'Jaipur')
+  assert.equal(drop('Delhi to Agra non ac'), 'Agra')
+  assert.equal(drop('Delhi to Sector 62, Noida one way'), 'Sector 62, Noida')
+  assert.equal(e('Jaipur round trip to Delhi').pickup, 'Jaipur')
+  // guards: a place keeps a qualifier word that is not at its end, or is its only word
+  assert.equal(drop('Delhi to Sector 62, Noida kal 6 am'), 'Sector 62, Noida')
+  assert.equal(drop('Delhi to AC Market, Tardeo'), 'AC Market')
+  assert.equal(drop('Delhi to Block C, AC Market'), 'Block C, AC Market')
+  assert.equal(drop('Noida to Return'), 'Return')
+})
+
 test('extractor: several fares, ranges and per-km rates give no fare', () => {
   const f = (t) => extract(t, at('2026-11-20T10:00:00+05:30')).fare
   assert.equal(f('Delhi to Agra kal 6 am Sedan fare 6000 7000 8000 negotiable'), null)

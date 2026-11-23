@@ -48,14 +48,22 @@ function minutes(hs, ms, suffix, context) {
   else if (!(h <= 23 && (h > 12 || h === 0 || hs.startsWith('0')))) return null
   return min > 59 ? null : h * 60 + min
 }
-// The drop ends at a comma ("Agra, one way"), except one comma after a sub-locality ("Sector 62, Noida").
+// Removes trip qualifiers ("one way", "urgent") from the end of a short text; '' when nothing else is left.
+const stripQualifiers = (p) => (p.length > R.FIELD_MAX_CHARS ? p : ` ${p}`.replace(R.TRAILING_QUALIFIERS, '').trim())
+
+// The drop ends at a comma ("Agra, one way"), except one comma after a sub-locality ("Sector 62, Noida"),
+// and only when what follows is more than trip qualifiers ("Sector 62, one way" -> "Sector 62").
 function dropPart(place) {
   const parts = place?.split(',') ?? []
-  return parts.length > 1 && R.SUB_LOCALITY.test(parts[0]) ? `${parts[0]},${parts[1]}` : parts[0]
+  const continues = parts.length > 1 && R.SUB_LOCALITY.test(parts[0]) && /\p{L}/u.test(stripQualifiers(parts[1].trim()))
+  return continues ? `${parts[0]},${parts[1]}` : parts[0]
 }
 function clean(place) {
-  const p = place?.replace(/\s+/g, ' ').replace(/\s+,/g, ',').replace(/^[\s,-]+|[\s,-]+$/g, '')
-  return p && /\p{L}/u.test(p) && p.length <= R.FIELD_MAX_CHARS && p.split(' ').length <= R.PLACE_MAX_WORDS ? p : null
+  let p = place?.replace(/\s+/g, ' ').replace(/\s+,/g, ',').replace(/^[\s,-]+|[\s,-]+$/g, '')
+  if (!p || p.length > R.FIELD_MAX_CHARS) return null
+  const q = stripQualifiers(p)
+  if (/\p{L}/u.test(q)) p = q // a qualifier that is the whole place ("Return") stays
+  return /\p{L}/u.test(p) && p.split(' ').length <= R.PLACE_MAX_WORDS ? p : null
 }
 
 /** extract(text, receivedAt) -> { pickup, drop, tripDateTime, carType, fare, contact }; null when not found or ambiguous. Pure. */

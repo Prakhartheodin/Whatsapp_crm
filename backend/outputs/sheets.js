@@ -7,9 +7,10 @@ const TOKEN_URL = 'https://oauth2.googleapis.com/token'
 const SCOPE = 'https://www.googleapis.com/auth/spreadsheets'
 
 /**
- * Google Sheets append with a service account. append(booking) -> true (written), false (not
- * written: safe to retry) or 'unknown' (timeout/network error after sending: may be written,
- * so the caller must not retry). Never throws.
+ * Google Sheets append with a service account. append(booking, { check }) -> true (written), false
+ * (not written) or 'unknown' (timeout/network error after sending: may be written). Never throws.
+ * Every row ends with the booking id (column K). With check (any retry), that column is read first
+ * and a booking already in it counts as written, so a retry never adds a second row.
  */
 export function createSheets(config, { fetch = globalThis.fetch, logger, now = () => new Date(), sleep = delay }) {
   if (!config.sheetsEnabled) return { enabled: false, append: async () => false }
@@ -27,6 +28,9 @@ export function createSheets(config, { fetch = globalThis.fetch, logger, now = (
   const opts = { logger, sleep, output: 'sheets' }
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(config.googleSheetId)}/values/` +
     `${encodeURIComponent(config.googleSheetRange || 'Sheet1!A1')}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`
+  // Booking ID column only. Cost: one download of that column (about 25 bytes per row) per retry.
+  const idsUrl = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(config.googleSheetId)}/values/` +
+    `${encodeURIComponent(`${(config.googleSheetRange || 'Sheet1!A1').split('!')[0]}!K:K`)}?majorDimension=COLUMNS`
   let token = null
   let expiresAt = 0
 
@@ -49,25 +53,36 @@ export function createSheets(config, { fetch = globalThis.fetch, logger, now = (
 
   return {
     enabled: true,
-    async append(b) {
+    async append(b, { check = false } = {}) {
       try {
+        const id = String(b.id ?? b._id ?? '')
         // RAW: strings stay strings, so a message starting with "=" is never a formula.
         // Google rejects a cell over 50 000 chars, which would lose the whole row.
         const row = [ist(b.receivedAt), ist(b.tripDateTime), b.pickup ?? '', b.drop ?? '', b.carType ?? '', b.fare ?? '',
-          b.contact ?? '', b.source ?? '', b.confidence ?? '', b.rawText ?? ''].map((c) => (typeof c === 'string' ? c.slice(0, 50_000) : c))
+          b.contact ?? '', b.source ?? '', b.confidence ?? '', b.rawText ?? '', id].map((c) => (typeof c === 'string' ? c.slice(0, 50_000) : c))
+        // 401: the cached token was rejected; one more try with a fresh one (nothing was written).
         for (let attempt = 0; ; attempt++) {
           const t = await accessToken()
           if (!t) return false
+          const authorization = `Bearer ${t}`
+          if (check && id) {
+            const got = await call(fetch, idsUrl, { headers: { authorization } }, opts)
+            if (got.ok && (got.body.values?.[0] ?? []).map(String).includes(id)) return true // an earlier try wrote it
+            if (!got.ok) {
+              if (got.status) token = null // the server rejected it (maybe the token)
+              if (got.status === 401 && !attempt) continue
+              return false // a failed read appended nothing
+            }
+          }
           const res = await call(fetch, url, {
             method: 'POST',
-            headers: { authorization: `Bearer ${t}`, 'content-type': 'application/json' },
+            headers: { authorization, 'content-type': 'application/json' },
             body: JSON.stringify({ values: [row] }),
           }, opts)
           if (res.ok) return true
-          token = null // a revoked token is not reused until it expires
           if (res.unknown) return 'unknown'
+          token = null // a revoked token is not reused until it expires
           if (res.status !== 401 || attempt) return false
-          // 401: the cached token was rejected; one retry with a fresh one (nothing was written).
         }
       } catch (err) {
         logger.error({ output: 'sheets', error: err.name }, 'output failed')

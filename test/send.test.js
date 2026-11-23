@@ -114,13 +114,13 @@ test('sender: skipped with a warning when the socket is not open', async () => {
   assert.ok(r.deps.logger.lines.some((l) => l.level === 'warn'))
 })
 
-test('sender: a failed sendMessage returns false and the queue keeps going', async () => {
+test('sender: a sendMessage that throws is an unknown outcome (it may have gone out); the queue keeps going', async () => {
   const r = rig()
   let n = 0
   const real = r.sock.sendMessage
   r.sock.sendMessage = async (...a) => { if (n++ === 0) throw new Error('socket gone'); return real(...a) }
   const s = createSender(on, r.deps)
-  assert.deepEqual(await Promise.all([s.send('a'), s.send('b')]), [false, true])
+  assert.deepEqual(await Promise.all([s.send('a'), s.send('b')]), ['unknown', true])
 })
 
 // ---- Ban-risk guard: nothing else in the codebase may send, mark read, show presence, join, look up contacts ----

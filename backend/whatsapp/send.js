@@ -20,7 +20,7 @@ export function resetSenderForTests() {
 }
 
 /**
- * send(text) -> Promise<true | false>, resolved after the message was sent (or skipped).
+ * send(text) -> Promise<true | false | 'unknown'>: sent, not sent (skipped), or sendMessage threw (may have gone out).
  * There is no recipient parameter: the recipient is fixed at start-up. At most one enabled
  * sender per process: build it once and keep `getSock` pointing at the current socket.
  */
@@ -57,8 +57,9 @@ export function createSender(config, { getSock, logger, sleep = delay, random = 
       await sock.sendMessage(jid, { text: String(text), linkPreview: null })
       return true
     } catch (err) {
-      logger.error({ err }, 'whatsapp send failed')
-      return false
+      // It may have gone out before the error: unknown, so a retry is labelled as a possible repeat.
+      logger.error({ err }, 'whatsapp send failed (outcome unknown)')
+      return 'unknown'
     }
   }
 

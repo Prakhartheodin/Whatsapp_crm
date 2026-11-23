@@ -1,7 +1,7 @@
 import { setTimeout as delay } from 'node:timers/promises'
 import { call } from './common.js'
 
-/** Telegram bot alert. send(text) -> true | false; never throws. */
+/** Telegram bot alert. send(text) -> true, false (not sent) or 'unknown' (timeout: may have been sent); never throws. */
 export function createTelegram(config, { fetch = globalThis.fetch, logger, sleep = delay }) {
   if (!config.telegramEnabled) {
     logger.warn('TELEGRAM_ENABLED=false: heartbeat, session-down and booking alerts are not sent anywhere')
@@ -26,8 +26,8 @@ export function createTelegram(config, { fetch = globalThis.fetch, logger, sleep
       }
       const res = await call(fetch, url, {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
-      }, { logger, sleep, output: 'telegram', retryNetwork: true }) // a duplicate alert is harmless
-      return res.ok
+      }, { logger, sleep, output: 'telegram' })
+      return res.ok || (res.unknown ? 'unknown' : false)
     },
   }
 }
