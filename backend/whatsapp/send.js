@@ -37,7 +37,7 @@ export function createSender(config, { getSock, logger, sleep = delay, random = 
   created = true
   const jid = `${digits}@s.whatsapp.net`
 
-  async function deliver(text) {
+  async function deliver(text, onStart) {
     for (;;) {
       const t = now().getTime()
       while (sentAt.length && t - sentAt[0] >= 60_000) sentAt.shift()
@@ -49,6 +49,12 @@ export function createSender(config, { getSock, logger, sleep = delay, random = 
     const sock = getSock()
     if (!sock?.ws?.isOpen) {
       logger.warn('whatsapp send skipped: socket not open')
+      return false
+    }
+    try {
+      await onStart?.() // the caller's "send started" mark; if it cannot be written, do not send
+    } catch (err) {
+      logger.warn({ err }, 'whatsapp send not started: onStart failed')
       return false
     }
     sentAt.push(now().getTime())
@@ -67,14 +73,15 @@ export function createSender(config, { getSock, logger, sleep = delay, random = 
     enabled: true,
     /** Messages waiting or being sent (lost if the process stops now). */
     pending: () => pending,
-    send(text) {
+    /** onStart: optional, awaited right before the socket call (after the queue wait and the delay). */
+    send(text, { onStart } = {}) {
       if (pending >= MAX_QUEUE) {
         logger.warn('whatsapp send queue full; message dropped')
         return Promise.resolve(false)
       }
       pending++
       // Strictly sequential, FIFO.
-      const p = chain.then(() => deliver(text)).finally(() => { pending-- })
+      const p = chain.then(() => deliver(text, onStart)).finally(() => { pending-- })
       chain = p.catch(() => {})
       return p
     },

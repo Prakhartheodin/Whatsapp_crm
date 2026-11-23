@@ -22,19 +22,20 @@ export function createOutputs({ telegram, sheets, sender, logger }) {
   const outputs = {
     telegram: [telegram, (b, o) => telegram.send(alert(b, o))],
     sheets: [sheets, (b, o) => sheets.append(b ?? {}, { check: o.check })],
-    whatsappSend: [sender, (b, o) => sender.send(alert(b, o))],
+    whatsappSend: [sender, (b, o) => sender.send(alert(b, o), { onStart: o.onStart })],
   }
   return {
     status: () => ({ sheets: sheets.enabled, telegram: telegram.enabled, whatsappSend: sender.enabled }),
     /**
      * Fans out to every enabled output (or only those named in `only`). repeat: the alert text starts
-     * with REPEAT_LABEL; check: Sheets first looks for the booking's row. Never rejects; one failing
+     * with REPEAT_LABEL; check: Sheets first looks for the booking's row; onStart: run by the WhatsApp
+     * sender right before the socket call (after its queue and delay). Never rejects; one failing
      * output never blocks the others. Resolves to { telegram, sheets, whatsappSend }: true sent,
      * false not sent, 'unknown' maybe sent (timeout), null disabled or not asked.
      */
-    async onConfirmed(booking, { only, repeat = false, check = false } = {}) {
+    async onConfirmed(booking, { only, repeat = false, check = false, onStart } = {}) {
       const names = Object.keys(outputs).filter((k) => outputs[k][0].enabled && (!only || only.includes(k)))
-      const settled = await Promise.allSettled(names.map((k) => Promise.resolve(booking).then((b) => outputs[k][1](b, { repeat, check }))))
+      const settled = await Promise.allSettled(names.map((k) => Promise.resolve(booking).then((b) => outputs[k][1](b, { repeat, check, onStart }))))
       const result = { telegram: null, sheets: null, whatsappSend: null }
       names.forEach((k, i) => {
         const v = settled[i].status === 'fulfilled' && settled[i].value

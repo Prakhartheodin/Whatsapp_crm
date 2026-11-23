@@ -320,3 +320,13 @@ test('outputs: a possible repeat is labelled on Telegram and WhatsApp; Sheets ge
   assert.equal(got.telegram, formatAlert(booking), 'no label by default')
   assert.deepEqual(got.sheets, { check: false })
 })
+
+test('sheets: GOOGLE_SHEET_RANGE must name the tab and start at column A (the id is column K)', async () => {
+  const { config } = await sheetsSetup()
+  for (const range of ['A1', 'Bookings!B1', 'Sheet1', '!A1']) {
+    assert.throws(() => createSheets({ ...config, googleSheetRange: range }, { logger: fakeLogger() }), /GOOGLE_SHEET_RANGE/, range)
+  }
+  for (const range of ['Sheet1!A1', 'Bookings!A:K', "'My Tab'!A2"]) {
+    assert.equal(createSheets({ ...config, googleSheetRange: range }, { logger: fakeLogger() }).enabled, true, range)
+  }
+})

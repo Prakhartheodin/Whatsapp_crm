@@ -18,7 +18,8 @@ const OPS = {
   $options: () => true,
 }
 const one = (v, c) =>
-  c && typeof c === 'object' && !(c instanceof Date)
+  c && typeof c === 'object' && '$exists' in c ? (v !== undefined) === c.$exists
+  : c && typeof c === 'object' && !(c instanceof Date)
     ? c.$ne === null && Object.keys(c).length === 1 ? v != null : v != null && Object.entries(c).every(([op, x]) => OPS[op](v, x, c))
     : c === null ? v == null : String(v) === String(c)
 export const match = (d, f) =>

@@ -27,7 +27,14 @@ export function createOutbox({ Booking, outputs, logger, now = () => new Date(),
     const st = outputs.status()
     return NAMES.filter((k) => st[k])
   }
-  const missing = (names) => names.map((k) => ({ wanted: k, [`delivered.${k}`]: null, [`givenUp.${k}`]: null }))
+  // A claim whose first attempt was never recorded (process died, or its update failed) has no
+  // `wanted` yet and no attempt: it still wants every enabled output. Bookings from before `wanted`
+  // existed were attempted (outputAttempts >= 1) and stay excluded.
+  const unsnapshotted = { wanted: { $exists: false }, outputAttempts: 0 }
+  const missing = (names) => [
+    ...names.map((k) => ({ wanted: k, [`delivered.${k}`]: null, [`givenUp.${k}`]: null })),
+    ...(names.length ? [unsnapshotted] : []),
+  ]
   const pendingFilter = (names, t, minAge) => ({
     status: 'confirmed',
     outputsSentAt: { $gte: new Date(t - MAX_AGE_MS), $lte: new Date(t - minAge) },
@@ -49,8 +56,11 @@ export function createOutbox({ Booking, outputs, logger, now = () => new Date(),
 
   async function sendOne(id, doc, booking, k, retry) {
     const repeat = Boolean(doc.sending?.[k]) // an earlier send of this output has no recorded outcome
-    await Booking.updateOne({ _id: id }, { $set: { [`sending.${k}`]: now() } }) // write-ahead; if it fails, nothing is sent
-    const v = (await outputs.onConfirmed(booking, { only: [k], repeat, check: retry }))[k]
+    // Write-ahead mark; if it cannot be written, nothing is sent. WhatsApp: written by the sender
+    // right before the socket call, so a message still waiting in its queue is not "maybe sent".
+    const mark = () => Booking.updateOne({ _id: id }, { $set: { [`sending.${k}`]: now() } })
+    if (k !== 'whatsappSend') await mark()
+    const v = (await outputs.onConfirmed(booking, { only: [k], repeat, check: retry, onStart: mark }))[k]
     if (v === true) await record(id, { [`delivered.${k}`]: now(), [`sending.${k}`]: null })
     else if (v !== 'unknown') await record(id, { [`sending.${k}`]: null }) // definitely not sent: next try unlabelled
     return v // 'unknown' keeps the marker, so the next try is labelled (Sheets: checked)
@@ -65,6 +75,10 @@ export function createOutbox({ Booking, outputs, logger, now = () => new Date(),
     const $set = { lastAttemptAt: now(), ...(first && { wanted: enabledNames() }) }
     const doc = await Booking.findOneAndUpdate({ _id: id, ...filter }, { $inc: { outputAttempts: 1 }, $set }, { returnDocument: 'after' }).lean()
     if (!doc) return
+    if (!doc.wanted) {
+      doc.wanted = enabledNames()
+      await Booking.updateOne({ _id: id }, { $set: { wanted: doc.wanted } })
+    }
     const shaped = booking ?? toBooking(doc)
     const names = pick(doc)
     const results = await Promise.all(names.map((k) => sendOne(id, doc, shaped, k, !first).catch((err) => {
@@ -98,9 +112,11 @@ export function createOutbox({ Booking, outputs, logger, now = () => new Date(),
 
   /** Outputs still missing 7 days after the claim: given up, logged and counted, never silently dropped. */
   async function expire(t) {
+    const enabled = enabledNames()
     for (const k of NAMES) {
+      const wants = enabled.includes(k) ? { $or: [{ wanted: k }, unsnapshotted] } : { wanted: k }
       const { modifiedCount } = await Booking.updateMany(
-        { status: 'confirmed', outputsSentAt: { $lt: new Date(t - MAX_AGE_MS) }, wanted: k, [`delivered.${k}`]: null, [`givenUp.${k}`]: null },
+        { status: 'confirmed', outputsSentAt: { $lt: new Date(t - MAX_AGE_MS) }, ...wants, [`delivered.${k}`]: null, [`givenUp.${k}`]: null },
         { $set: { [`givenUp.${k}`]: new Date(t) } },
       )
       if (modifiedCount) logger.error({ output: k, bookings: modifiedCount }, 'booking output not delivered within 7 days; given up')
@@ -115,7 +131,7 @@ export function createOutbox({ Booking, outputs, logger, now = () => new Date(),
     for (const d of docs) {
       const id = String(d._id)
       await exclusive(id, () => attempt(id, pendingFilter(names, now().getTime(), QUICK_MS),
-        (fresh) => names.filter((k) => fresh.wanted?.includes(k) && !fresh.delivered?.[k] && !fresh.givenUp?.[k])))
+        (fresh) => names.filter((k) => fresh.wanted.includes(k) && !fresh.delivered?.[k] && !fresh.givenUp?.[k])))
     }
   }
   const run = () => (running ??= runOnce()

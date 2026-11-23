@@ -23,7 +23,7 @@ export function createHeartbeat({ config, getLastMessageAt, getWaStatus, alert, 
     logger[text === lastLogged ? 'debug' : 'warn']({ alert: text.split('\n')[0] }, 'heartbeat alert')
     lastLogged = text
     if (!alert) return true // nothing to deliver to, so nothing to retry
-    if (!(await alert(text))) return false
+    if ((await alert(text)) !== true) return false // 'unknown' (timeout) is retried: a repeated alert is harmless
     lastAlertAt = now()
     return true
   }

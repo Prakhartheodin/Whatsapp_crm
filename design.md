@@ -400,7 +400,8 @@ max 200 chars; `/ingest` text capped at 4 000 chars). TLS is terminated by a rev
   second copy only follows a send with an unknown outcome, and is then labelled (Telegram/WhatsApp:
   first line "Possible repeat ...") or suppressed (Sheets finds its row by the Booking ID column).
   - The single `onConfirmed` (pipeline and dashboard confirm) snapshots `wanted`, counts the attempt,
-    then per output: set `sending.<k>`, send, record `delivered.<k>` (or clear the mark after a clean
+    then per output: set `sending.<k>` (WhatsApp: in the sender's `onStart`, right before the socket
+    call, so a message still queued is not "maybe sent"), send, record `delivered.<k>` (or clear the mark after a clean
     failure; leave it after an unknown outcome) as soon as that output settles. Recording is tried 3
     times with backoff, so a brief MongoDB blip does not become a repeat.
   - The job re-sends, oldest first, 10 per run, only the `wanted` and currently enabled outputs not
@@ -409,7 +410,11 @@ max 200 chars; `/ingest` text capped at 4 000 chars). TLS is terminated by a rev
     stored row in the same atomic update that counts the attempt, so a stale batch never re-sends;
     bookings being delivered right now are skipped. Retries of Sheets read column K first.
   - Older than 7 days: missing `wanted` outputs get `givenUp`, one error line per output and run.
-  - Bookings without `wanted` (from before this design) are never retried.
+  - A claim with no `wanted` and `outputAttempts: 0` (the first attempt's update never ran: crash or
+    MongoDB error) counts as missing every enabled output: retried, counted pending, expired after 7
+    days; the retry takes the snapshot. Bookings without `wanted` but with attempts (from before
+    this design) are never retried.
+  - `GOOGLE_SHEET_RANGE` must name the tab and start at column A (checked at start), so the id is K.
   - Telegram returns 'unknown' on a timeout/network error and is not retried inside the request;
     the WhatsApp sender returns 'unknown' when `sendMessage` throws. WhatsApp retries use the
     same sender queue. `/health` reports `counts.outputsPending` and `counts.outputsFailed`.

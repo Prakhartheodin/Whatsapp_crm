@@ -164,3 +164,21 @@ test('no WhatsApp send/read/presence/join/lookup calls outside whatsapp/send.js'
   const sendSrc = await fs.readFile(path.join(root, 'backend/whatsapp/send.js'), 'utf8')
   assert.equal([...stripComments(sendSrc).matchAll(/\bsendMessage\b/g)].length, 1, 'send.js sends from exactly one place')
 })
+
+test('sender: onStart runs right before the socket call (after the delay); if it fails nothing is sent', async () => {
+  const r = rig()
+  const order = []
+  const real = r.sock.sendMessage
+  r.sock.sendMessage = async (...a) => { order.push('send'); return real(...a) }
+  r.deps.sleep = async () => { order.push('sleep') }
+  const s = createSender(on, r.deps)
+  assert.equal(await s.send('a', { onStart: async () => { order.push('start') } }), true)
+  assert.deepEqual(order, ['sleep', 'start', 'send'])
+  assert.equal(await s.send('b', { onStart: async () => { throw new Error('mongo down') } }), false)
+  assert.equal(r.sent.length, 1)
+  resetSenderForTests()
+  const closed = rig({ open: false })
+  let started = false
+  assert.equal(await createSender(on, closed.deps).send('c', { onStart: () => { started = true } }), false)
+  assert.equal(started, false, 'not started when the socket is not open')
+})

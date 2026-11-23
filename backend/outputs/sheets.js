@@ -15,6 +15,10 @@ const SCOPE = 'https://www.googleapis.com/auth/spreadsheets'
 export function createSheets(config, { fetch = globalThis.fetch, logger, now = () => new Date(), sleep = delay }) {
   if (!config.sheetsEnabled) return { enabled: false, append: async () => false }
   if (!config.googleSheetId) throw new Error('GOOGLE_SHEET_ID: required when SHEETS_ENABLED=true')
+  // The Booking ID must land in column K of a known tab, or a retry cannot find its row.
+  if (!/^('[^']+'|[^'!]+)!A(\d+)?(:|$)/.test(config.googleSheetRange || 'Sheet1!A1')) {
+    throw new Error('GOOGLE_SHEET_RANGE: must name the tab and start at column A, e.g. Sheet1!A1')
+  }
   let email, key
   try {
     const sa = JSON.parse(fs.readFileSync(config.googleServiceAccountJson, 'utf8'))

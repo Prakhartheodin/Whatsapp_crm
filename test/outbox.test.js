@@ -30,14 +30,15 @@ function rig(docs, { enabled = { telegram: true, sheets: true, whatsappSend: fal
   const n = {}
   s.outputs = {
     status: () => ({ ...enabled }),
-    async onConfirmed(b, { only, repeat, check } = {}) {
+    async onConfirmed(b, { only, repeat, check, onStart } = {}) {
       const names = Object.keys(enabled).filter((k) => enabled[k] && (!only || only.includes(k)))
       const out = none()
       for (const k of names) {
         s.calls.push(`${Number.parseInt(b.id, 16)}:${k}${repeat ? '+r' : ''}${check && k === 'sheets' ? '+c' : ''}`)
         n[k] = (n[k] ?? 0) + 1
         const r = results[k] ?? true
-        out[k] = await (typeof r === 'function' ? r(n[k]) : r)
+        if (typeof r !== 'function' && k === 'whatsappSend') await onStart?.()
+        out[k] = await (typeof r === 'function' ? r(n[k], onStart) : r)
       }
       return out
     },
@@ -160,7 +161,7 @@ test('outbox: a first delivery that finishes after the retry batch was read is n
   assert.deepEqual(s.calls.sort(), ['1:sheets+c', '1:whatsappSend', '2:sheets', '2:whatsappSend'])
 })
 
-test('outbox: a restart while WhatsApp is queued re-sends only WhatsApp, labelled (it may have gone out)', async () => {
+test('outbox: a restart while WhatsApp is still queued (not started) re-sends only WhatsApp, unlabelled', async () => {
   const enabled = { telegram: true, sheets: true, whatsappSend: true }
   const before = rig([booking(1, { wanted: undefined })], { enabled, results: { whatsappSend: () => new Promise(() => {}) } })
   before.box.deliver({ id: id(1) })
@@ -170,8 +171,21 @@ test('outbox: a restart while WhatsApp is queued re-sends only WhatsApp, labelle
   const after = rig(null, { enabled, Booking: before.Booking }) // pm2 restart: new process, same store
   after.t = min(6)
   await after.box.run()
-  assert.deepEqual(after.calls, ['1:whatsappSend+r'])
+  assert.deepEqual(after.calls, ['1:whatsappSend'], 'never reached the socket: no label')
   assert.ok(after.doc(1).delivered.whatsappSend)
+})
+
+test('outbox: a restart after the WhatsApp send started (socket call under way) re-sends it labelled', async () => {
+  const enabled = { telegram: false, sheets: false, whatsappSend: true }
+  const before = rig([booking(1, { wanted: undefined })], { enabled,
+    results: { whatsappSend: async (n, onStart) => { await onStart(); return new Promise(() => {}) } } })
+  before.box.deliver({ id: id(1) })
+  for (let i = 0; i < 5; i++) await tick()
+  assert.ok(before.doc(1).sending.whatsappSend)
+  const after = rig(null, { enabled, Booking: before.Booking })
+  after.t = min(6)
+  await after.box.run()
+  assert.deepEqual(after.calls, ['1:whatsappSend+r'])
 })
 
 test('outbox: 5 quick attempts, one error line at the switch, then hourly retries', async () => {
@@ -224,8 +238,8 @@ test('outbox: an output enabled later is not sent for older bookings; a disabled
   assert.deepEqual(await off.box.counts(), { outputsPending: 0, outputsFailed: 0 })
 })
 
-test('outbox: bookings from before this change (no wanted list) are left alone', async () => {
-  const s = rig([booking(1, { wanted: undefined })])
+test('outbox: bookings from before this change (no wanted list, already attempted) are left alone', async () => {
+  const s = rig([booking(1, { wanted: undefined, outputAttempts: 1 })])
   await s.box.run()
   assert.deepEqual(s.calls, [])
 })
@@ -250,4 +264,32 @@ test('outbox: start runs once at once and is unref-ed; stop clears it', async ()
   s.box.stop()
   for (let i = 0; i < 5; i++) await tick()
   assert.equal(s.calls.length, 2)
+})
+
+test('outbox: a claim whose first attempt never got recorded (write failed or process died) is delivered later and counted', async () => {
+  const s = rig([booking(1, { wanted: undefined })], { enabled: { telegram: true, sheets: false, whatsappSend: false } })
+  const real = s.Booking.findOneAndUpdate
+  let fail = true
+  s.Booking.findOneAndUpdate = (...a) => {
+    if (fail) { fail = false; return { lean: async () => { throw new Error('mongo blip') } } }
+    return real(...a)
+  }
+  await s.box.deliver({ id: id(1) }) // the first attempt's update throws: nothing sent, nothing recorded
+  assert.deepEqual(s.calls, [])
+  assert.equal(s.doc(1).outputAttempts, 0)
+  assert.deepEqual(await s.box.counts(), { outputsPending: 1, outputsFailed: 0 })
+  s.t = min(3)
+  await s.box.run()
+  assert.deepEqual(s.calls, ['1:telegram'])
+  assert.deepEqual(s.doc(1).wanted, ['telegram'], 'the snapshot is taken by the retry')
+  assert.ok(s.doc(1).delivered.telegram)
+  assert.deepEqual(await s.box.counts(), { outputsPending: 0, outputsFailed: 0 })
+})
+
+test('outbox: such a claim still undelivered after 7 days is given up and counted', async () => {
+  const s = rig([booking(1, { wanted: undefined })], { enabled: { telegram: true, sheets: false, whatsappSend: false } })
+  s.t = new Date(T0.getTime() + 8 * 86_400_000)
+  await s.box.run()
+  assert.ok(s.doc(1).givenUp.telegram)
+  assert.deepEqual(await s.box.counts(), { outputsPending: 0, outputsFailed: 1 })
 })

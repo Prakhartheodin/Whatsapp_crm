@@ -241,3 +241,19 @@ test('heartbeat: without an alert channel (Telegram off) an alert is logged once
   assert.equal(hb.state().lastAlertAt, null, 'nothing was delivered')
   assert.equal(hb.state().quiet, true)
 })
+
+test('heartbeat: an alert with an unknown outcome (Telegram timeout) is not counted as sent and is retried', async () => {
+  const s = rig({ last: ist(9) })
+  const results = ['unknown', true]
+  const hb = createHeartbeat({
+    config: { heartbeatMinutes: 120, sessionDownAlertMinutes: 10 },
+    getLastMessageAt: async () => s.last, getWaStatus: () => s.wa, now: () => s.t, logger,
+    alert: async (text) => { s.alerts.push(text); return results.shift() },
+  })
+  s.t = ist(12); await hb.check()
+  assert.equal(hb.state().lastAlertAt, null)
+  s.t = ist(12, 5); await hb.check()
+  s.t = ist(12, 10); await hb.check()
+  assert.equal(s.alerts.length, 2)
+  assert.deepEqual(hb.state().lastAlertAt, ist(12, 5))
+})
