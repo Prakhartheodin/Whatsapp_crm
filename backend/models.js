@@ -27,3 +27,33 @@ const adminSchema = new mongoose.Schema(
 )
 
 export const Admin = mongoose.model('Admin', adminSchema)
+
+const bookingSchema = new mongoose.Schema(
+  {
+    source: { type: String, required: true },
+    rawText: { type: String, required: true },
+    pickup: String,
+    drop: String,
+    pickupNorm: String,
+    dropNorm: String,
+    tripDateTime: { type: Date, default: null },
+    carType: { type: String, default: null },
+    fare: { type: Number, default: null },
+    contact: { type: String, default: null },
+    receivedAt: { type: Date, required: true },
+    confidence: { type: Number, min: 0, max: 1 },
+    rawMessageId: { type: mongoose.Schema.Types.ObjectId, ref: 'RawMessage', default: null },
+    status: { type: String, enum: ['confirmed', 'review', 'rejected'], required: true },
+    decidedBy: { type: String, enum: ['rules', 'llm', 'admin'], required: true },
+    decidedAt: { type: Date, default: Date.now },
+    otherSources: [{ _id: false, source: String, rawMessageId: mongoose.Schema.Types.ObjectId, receivedAt: Date }],
+    outputsSentAt: { type: Date, default: null },
+  },
+  { collection: 'bookings' },
+)
+bookingSchema.index({ status: 1, receivedAt: -1 })
+bookingSchema.index({ contact: 1, receivedAt: -1 })
+// /api/raw looks up the booking status of each page of raw messages.
+bookingSchema.index({ rawMessageId: 1 })
+
+export const Booking = mongoose.model('Booking', bookingSchema)

@@ -32,12 +32,12 @@ Items marked **(call)** were decided by the builder, not the owner; change freel
 ├── .env.example
 ├── .gitignore                 # auth/, .env, node_modules/, logs/
 ├── ecosystem.config.cjs       # pm2
-├── package.json               # exact pinned versions
+├── package.json               # the only one (monorepo); exact pinned versions
 ├── auth/                      # Baileys session (gitignored, back this up)
 ├── scripts/
 │   ├── groups.js              # npm run groups
 │   └── create-admin.js        # npm run create-admin [-- --reset]: the single admin
-├── src/
+├── backend/
 │   ├── index.js               # boot: config -> mongo -> http -> whatsapp -> jobs
 │   ├── config.js              # read + validate env, fail fast on bad values
 │   ├── logger.js              # pino + phone masking
@@ -60,15 +60,16 @@ Items marked **(call)** were decided by the builder, not the owner; change freel
 │   │   ├── telegram.js        # also used for alerts
 │   │   └── whatsapp.js        # wraps whatsapp/send.js
 │   ├── http/
-│   │   ├── server.js          # express app
-│   │   ├── auth.js            # API token + admin session
+│   │   ├── server.js          # createApp(deps): express app, headers, static, errors
+│   │   ├── auth.js            # API token + admin session + login rate limit
 │   │   └── routes.js          # health, export, ingest, dashboard JSON
-│   ├── jobs/
-│   │   ├── heartbeat.js
-│   │   └── retention.js
-│   └── public/                # dashboard: index.html, login.html, app.js, app.css
+│   └── jobs/
+│       ├── heartbeat.js
+│       └── retention.js
+├── frontend/                  # static dashboard served by the backend: index.html, login.html, JS, CSS
 └── test/
     ├── samples.json           # owner pastes real messages here
+    ├── http.test.js           # API against in-memory fake models
     ├── scorer.test.js
     ├── extractor.test.js
     └── dedupe.test.js
@@ -115,17 +116,34 @@ Hard rules, enforced in code, not by convention:
   `WHATSAPP_SEND_ENABLED=true`, sends only to `TARGET_NUMBER`, waits a random
   3-8 s before each send, and allows at most 10 messages per rolling minute
   (extra messages wait in an in-memory queue).
-- Auth state persisted in `./auth` (multi-file auth state). If valid creds exist,
-  no QR/pairing is ever requested.
-- Disconnect handling:
-  - Logged out (`DisconnectReason.loggedOut`): send Telegram alert, set state
-    `logged_out`, **stop reconnecting**. HTTP stays up so the dashboard shows it.
-    `./auth` is not deleted automatically; README explains re-linking.
-  - Connection replaced (another socket opened on this session): alert and stop,
-    same as logged out. Two sockets fighting over one session is itself a ban risk.
+- Auth state persisted in `AUTH_DIR` (default `./auth`, resolved from the project
+  folder; multi-file auth state), created/chmod-ed to 0700. It must not live in a
+  cloud-synced folder. If valid creds exist, no QR/pairing is ever requested.
+- QR / pairing code only with an interactive terminal (`process.stdout.isTTY`).
+  Without one (pm2): fatal log, state `needs_link`, no reconnect. Link with `npm run groups`.
+- On every `open`, `creds.json` is copied to `creds.backup.json`. On start, a damaged
+  `creds.json` is restored from the backup; if both are damaged the service stops
+  (`logged_out`) instead of creating a new identity. `npm run groups` and SIGINT/SIGTERM
+  wait for in-flight credential writes (`flushCreds()`) before exiting.
+- libsignal's `console.info/warn/debug` (session objects with private keys) go to
+  `logger.debug` with objects dropped (`quietConsole()`); `console.log` is untouched.
+- Disconnect handling (one fatal log per stop status, pointing to the README section):
+  - Logged out (`DisconnectReason.loggedOut`, or multidevice mismatch): send Telegram alert,
+    set state `logged_out`, **stop reconnecting**. HTTP stays up so the dashboard shows it.
+    The auth folder is not deleted automatically; README explains re-linking.
+  - Connection replaced (another socket opened on this session): state `replaced`, alert
+    and stop. No re-link needed. Two sockets fighting over one session is itself a ban risk.
+  - Forbidden (403): state `blocked`, stop. Do not re-link.
   - Restart required (normal right after pairing): reconnect immediately.
   - Anything else: reconnect with exponential backoff 2 s -> 5 min cap, with jitter.
+    The attempt counter resets only after the connection stayed open for 60 s.
     Telegram alert if still down after `SESSION_DOWN_ALERT_MINUTES`.
+- MongoDB write failures: the message is appended to `spool/raw.jsonl` (0700 dir) and
+  replayed (same idempotent upsert) at start and on every Mongoose `connected`/`reconnected`.
+  Lines that fail stay; unreadable lines move to `spool/raw.rejected.jsonl`. Counts only in logs.
+- A target-group upsert with no content (undecryptable, stub) is logged as a warning with
+  group ID, message ID and stub/reason. Sender is the `@s.whatsapp.net` one of
+  `participant`/`participantAlt`, else `participant`; `me` for own messages.
 - Messages handled: `messages.upsert` of type `notify` and `append` (`append` covers messages that arrived while offline; the unique index drops repeats; confirm behaviour during step 3), only JIDs in
   `TARGET_GROUP_IDS`. Everything else is ignored without logging content.
 - Group names: one `groupMetadata` call per target group per process start, not per reconnect (4 calls),
@@ -177,7 +195,7 @@ Fields: `username`, `passwordHash` (`scrypt$<salt>$<hash>`), `createdAt`, `updat
 | otherSources | [{source, rawMessageId, receivedAt}] | duplicates folded into this row |
 | outputsSentAt | Date \| null | guards against double output |
 
-Indexes: `{status, receivedAt: -1}`, `{contact, receivedAt: -1}`.
+Indexes: `{status, receivedAt: -1}`, `{contact, receivedAt: -1}`, `{rawMessageId}` (the Raw tab's booking-status lookup).
 `rejected` rows are kept: together with admin-confirmed rows they are labelled
 examples for tuning the rules. Bookings are not purged by retention **(call)**;
 only raw messages are.
@@ -230,24 +248,34 @@ Two ways in; every route except `/login` and static login assets needs one:
   (constant-time compare). For `/ingest`, scripts, monitoring.
 - **Admin session**: `POST /login` with the username + password checked
   against the admin in the `admins` collection (scrypt hash; created with
-  `npm run create-admin`, reset with `-- --reset`). Sets an HMAC-signed cookie
-  (`SESSION_SECRET`), `HttpOnly`, `SameSite=Strict`, `Secure` in production,
-  7-day expiry. Login attempts limited to 5 per 15 min per IP (in memory).
-  State-changing routes accept JSON only; with `SameSite=Strict` that covers CSRF.
+  `npm run create-admin`, reset with `-- --reset`). Sets cookie
+  `sid=<base64url {u, exp}>.<HMAC-SHA256 with SESSION_SECRET>`, `HttpOnly`,
+  `SameSite=Strict`, `Path=/`, `Secure` in production, 7-day expiry; no session store.
+  Unknown username and wrong password give the same 401 and both cost one scrypt.
+  Rate limit: 5 failed logins per 15 min per IP (in memory, expired entries pruned,
+  attempts counted before the password check so parallel guesses cannot exceed it;
+  a success clears the count). Over the limit: `429 { error, retryAfterSec }`.
+  State-changing routes accept JSON only (`415` otherwise); with `SameSite=Strict` that covers CSRF.
+  Body limit 16 kB.
 
 There is no user table and no registration route.
 
 ### Hardening
 - Group members are untrusted authors. The dashboard inserts message text with
   `textContent` only, never `innerHTML`.
-- Response headers: `Content-Security-Policy: default-src 'self'; frame-ancestors 'none'`,
-  `X-Content-Type-Options: nosniff`.
-- In production Express binds to `127.0.0.1` (only the reverse proxy reaches it)
+- Response headers on everything: `Content-Security-Policy: default-src 'self'; frame-ancestors 'none'`,
+  `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`; `X-Powered-By` off.
+- In production Express binds to `127.0.0.1` by default (`HOST`; only the reverse proxy reaches it)
   and sets `trust proxy` to 1 so the login rate limit sees the real client IP.
-- `?token=` ends up in proxy logs and browser history. Prefer the header; our own
-  request logs drop the query string.
-- Google Sheets append uses `valueInputOption=RAW` so a message starting with `=`
-  is never evaluated as a formula.
+  This needs the proxy to send `X-Forwarded-For` (nginx: `proxy_set_header`, Caddy: by default);
+  without it all visitors share one limit and 5 bad passwords from anyone lock the admin out for 15 min.
+- `?token=` ends up in proxy logs and browser history. Prefer the header. There is
+  no request logging; error logs carry method + path only (no query string).
+- Errors: unknown `/api/*` -> JSON 404; unexpected errors are logged and answered
+  `500 { error: 'Internal error' }` with no stack trace.
+- Google Sheets append uses `valueInputOption=RAW` and the export writes plain
+  string cells, so a message starting with `=` is never evaluated as a formula.
+- `/api/raw` masks `sender` with `maskPhone` (the dashboard does not need it in full).
 - LLM pass: message text is untrusted input. No tools, output validated against a
   fixed schema, anything else is treated as `null`.
 - Logout clears the cookie only. To revoke every session, rotate `SESSION_SECRET`.
@@ -258,18 +286,22 @@ There is no user table and no registration route.
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/login`, `/logout` | admin session |
-| GET | `/health` | `{ whatsapp: state, lastMessageAt, perGroup: [{id, name, lastMessageAt, countToday}], counts: {rawToday, bookingsToday, reviewPending, duplicatesToday}, heartbeat }` |
-| GET | `/export?from=&to=&source=` | streams `.xlsx` of `confirmed` bookings |
-| POST | `/ingest` | body `{source, rawText, receivedAt}`; validated; runs the same pipeline; returns `{status, bookingId?, duplicateOf?}` |
+| GET | `/api/me` | `{ username }` |
+| GET | `/health` | `{ whatsapp: {status, since}, lastMessageAt, perGroup: [{id, name, lastMessageAt, countToday}], counts: {rawToday, bookingsToday, reviewPending, duplicatesToday}, heartbeat: {minutes, windowStart, windowEnd, quiet, lastAlertAt}, outputs: {sheets, telegram, whatsappSend} }`. `perGroup` falls back to the newest stored raw message after a restart |
+| GET | `/export?from=&to=&source=` | streams `.xlsx` of `confirmed` bookings (cursor + streaming writer), `bookings-<from>-<to>.xlsx` (`all` when unset); times in IST |
+| POST | `/ingest` | **not built yet** (needs the pipeline). Body `{source, rawText, receivedAt}`; validated; runs the same pipeline; returns `{status, bookingId?, duplicateOf?}` |
 | GET | `/api/bookings?status=&from=&to=&source=&q=&page=` | paged list (50/page), returns `total` |
-| POST | `/api/bookings/:id/confirm` | review -> confirmed, fires outputs |
+| POST | `/api/bookings/:id/confirm` | review -> confirmed; fires outputs once (claims `outputsSentAt` atomically) |
 | POST | `/api/bookings/:id/reject` | review -> rejected |
-| POST | `/api/bookings/:id/undo` | back to review (the Undo toast); does not unsend outputs |
+| POST | `/api/bookings/:id/undo` | admin-decided confirmed/rejected -> review (the Undo toast); does not unsend outputs, returns `outputsAlreadySent` |
 | GET | `/api/raw?group=&q=&from=&to=&page=` | paged raw messages |
 | GET | `/` and static files | dashboard |
 
-Input validation on every query/body field (dates parse, enums match, text length
-capped at 4 000 chars, `q` regex-escaped). TLS is terminated by a reverse proxy
+Transitions are one conditional `findOneAndUpdate` (expected status in the filter):
+wrong state -> `409`, unknown or malformed id -> `404`.
+Input validation on every query/body field, bad value -> `400` (dates must be ISO,
+enums match, `page` 1-10 000, `q` max 100 chars and regex-escaped, other text
+max 200 chars; `/ingest` text capped at 4 000 chars). TLS is terminated by a reverse proxy
 (nginx or Caddy) on the VPS; README covers it.
 
 ## 9. Jobs
@@ -291,13 +323,13 @@ capped at 4 000 chars, `q` regex-escaped). TLS is terminated by a reverse proxy
 All documented in `.env.example`.
 ```
 # core
-NODE_ENV, PORT, LOG_LEVEL, MONGODB_URI
+NODE_ENV, PORT=3000, HOST (127.0.0.1 in production, else 0.0.0.0), LOG_LEVEL, MONGODB_URI
 # (no TZ variable: IST is hard-coded as UTC+5:30, the TZ env is unreliable on Windows)
 # whatsapp
-TARGET_GROUP_IDS (comma-separated, 4), PAIRING_PHONE_NUMBER,
+TARGET_GROUP_IDS (comma-separated, 4), PAIRING_PHONE_NUMBER, AUTH_DIR=./auth (outside cloud-synced folders),
 WHATSAPP_SEND_ENABLED=false, TARGET_NUMBER, SESSION_DOWN_ALERT_MINUTES=10
 # auth
-API_TOKEN, SESSION_SECRET
+API_TOKEN, SESSION_SECRET (required, >= 32 chars each; the service refuses to start otherwise)
 # llm
 LLM_ENABLED=false, OPENAI_API_KEY, OPENAI_MODEL, LLM_CONFIRM_THRESHOLD=0.8
 # outputs
