@@ -5,7 +5,7 @@ import { createRoutes } from './routes.js'
 
 const FRONTEND = fileURLToPath(new URL('../../frontend/', import.meta.url))
 
-/** deps: { models: { Admin, Booking, RawMessage }, config, getHealthState, onConfirmed, pipeline, logger } */
+/** deps: { models: { Admin, Booking, RawMessage, IngestKey }, config, getHealthState, onConfirmed, pipeline, logger } */
 export function createApp(deps) {
   const { config, logger } = deps
   const auth = createAuth({ Admin: deps.models.Admin, config })

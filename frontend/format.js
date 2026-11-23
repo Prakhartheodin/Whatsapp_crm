@@ -57,4 +57,22 @@ export function presetRange(name, now = new Date()) {
 // True once the IST calendar day differs from the one the rows were rendered on.
 export const istDayChanged = (renderedDay, now = new Date()) => istToday(now) !== renderedDay
 
-export const quietLabel = (minutes) => `Quiet ${minutes % 60 === 0 ? `${minutes / 60}h` : `${minutes}m`}+`
+// A group is quiet only inside the heartbeat window (IST "HH:MM"-"HH:MM") and only when a threshold is set.
+export function isGroupQuiet(lastMessageAt, minutes, windowStart, windowEnd, now = new Date()) {
+  if (!(minutes > 0) || !/^\d{2}:\d{2}$/.test(windowStart || '') || !/^\d{2}:\d{2}$/.test(windowEnd || '')) return false
+  const hhmm = new Date(now.getTime() + IST_MS).toISOString().slice(11, 16)
+  if (hhmm < windowStart || hhmm >= windowEnd) return false
+  const last = lastMessageAt ? Date.parse(lastMessageAt) : NaN
+  return Number.isNaN(last) || now.getTime() - last > minutes * 60000
+}
+
+// Status lines for the outputs queue; nothing for zero or missing counts.
+export function outputsNote(counts = {}) {
+  const n = (v) => (Number.isInteger(v) && v > 0 ? v : 0)
+  const lines = []
+  if (n(counts.outputsPending)) lines.push(`${counts.outputsPending} alert${counts.outputsPending === 1 ? '' : 's'} waiting to send`)
+  if (n(counts.outputsFailed)) lines.push(`${counts.outputsFailed} alert${counts.outputsFailed === 1 ? '' : 's'} failed`)
+  return lines
+}
+
+export const quietLabel =(minutes) => `Quiet ${minutes % 60 === 0 ? `${minutes / 60}h` : `${minutes}m`}+`

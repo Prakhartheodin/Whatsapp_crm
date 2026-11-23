@@ -1,5 +1,6 @@
 // npm run create-admin [-- --reset]: create (or with --reset, replace) the single admin account.
 // The password is read from the terminal with echo off, never from argv, never logged.
+import { configLoaded } from '../backend/config-guard.js' // first: a malformed .env value is one fatal line
 import readline from 'node:readline'
 import { Writable } from 'node:stream'
 import mongoose from 'mongoose'
@@ -7,6 +8,7 @@ import { config } from '../backend/config.js'
 import { Admin } from '../backend/models.js'
 import { createAdmin } from '../backend/auth/admin.js'
 
+configLoaded()
 if (!config.mongoUri) {
   console.error('MONGODB_URI is not set (put it in .env).')
   process.exit(1)

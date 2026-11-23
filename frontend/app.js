@@ -1,6 +1,7 @@
 import { api, qs } from './api.js'
 import {
   DASH, dash, fmtWhen, fmtFare, sourceLabel, istToday, addDays, dayRange, presetRange, quietLabel, isDay, PRESETS, istDayChanged,
+  isGroupQuiet, outputsNote,
 } from './format.js'
 
 const POLL_MS = 15000
@@ -65,20 +66,26 @@ function connection(h) {
   return s
 }
 
+// The pill is aria-live: only touch it when the state really changes, so it is announced once.
+function setPill({ tone, text }) {
+  const pill = $('#pill')
+  const label = $('#pill-text')
+  if (label.textContent === text && pill.dataset.tone === tone) return
+  pill.dataset.tone = tone
+  label.textContent = text
+}
+
 async function loadHealth() {
   try {
     health = await api('/health')
     healthOk = new Date().toISOString()
   } catch {
     errorBar($('#screen-status'), true, healthOk)
+    setPill({ tone: 'warn', text: 'No server' }) // never keep showing "Connected" while unreachable
     return
   }
   errorBar($('#screen-status'), false)
-  const c = connection(health)
-  const pill = $('#pill')
-  pill.dataset.tone = c.tone
-  pill.textContent = c.text
-  pill.setAttribute('aria-label', `WhatsApp: ${c.text}. Open status`)
+  setPill(connection(health))
   setBadge(health.counts?.reviewPending || 0)
   const groups = health.perGroup || []
   const sources = [...groups.map((g) => [`whatsapp:${g.name}`, g.name]), ['app', 'App']]
@@ -114,10 +121,8 @@ function renderStatus() {
   const h = health
   const state = waState(h)
   const hb = h.heartbeat || {}
-  const now = Date.now()
-  const quietMs = (hb.minutes || 0) * 60000
   const groupRow = (g) => {
-    const quiet = !g.lastMessageAt || now - Date.parse(g.lastMessageAt) > quietMs
+    const quiet = isGroupQuiet(g.lastMessageAt, hb.minutes, hb.windowStart, hb.windowEnd)
     return el('tr', { class: quiet ? 'quiet' : null },
       el('th', { scope: 'row', text: dash(g.name) }),
       el('td', { text: fmtWhen(g.lastMessageAt) }, quiet ? el('span', { class: 'tag', text: 'Quiet' }) : null),
@@ -147,7 +152,8 @@ function renderStatus() {
         hb.quiet ? quietLabel(hb.minutes) : 'Messages arriving',
       ])),
     el('div', {}, el('h2', { text: 'Outputs' }),
-      el('dl', { class: 'counts' }, out('Sheets', o.sheets), out('Telegram', o.telegram), out('WhatsApp send', o.whatsappSend))),
+      el('dl', { class: 'counts' }, out('Sheets', o.sheets), out('Telegram', o.telegram), out('WhatsApp send', o.whatsappSend)),
+      ...outputsNote(c).map((line) => el('p', { class: line.endsWith('failed') ? 'out-note out-failed' : 'out-note', text: line }))),
     el('p', { class: 'updated', text: `Updated ${fmtWhen(healthOk)}` }),
   ].filter(Boolean))
 }
@@ -185,6 +191,7 @@ function feed(cfg) {
   let lastOk = null
   let gen = 0
   let newest = null
+  let failedOnce = false
 
   function range() {
     if (filters.preset === 'all') return {}
@@ -197,7 +204,8 @@ function feed(cfg) {
   function add(items, where) {
     const nodes = items.filter((i) => !ids.has(i.id)).map((i) => {
       ids.add(i.id)
-      if (!newest || i[cfg.timeField] > newest) newest = i[cfg.timeField]
+      // Only an unfiltered list says what the owner has seen (a filter would mark an older point).
+      if (!isFiltered() && (!newest || i[cfg.timeField] > newest)) newest = i[cfg.timeField]
       return cfg.render(i)
     })
     if (where === 'top') list.prepend(...nodes)
@@ -218,31 +226,38 @@ function feed(cfg) {
   const loadedOk = () => { lastOk = new Date().toISOString(); errorBar(section, false) }
   const fail = () => errorBar(section, true, lastOk)
 
-  async function reset() {
+  const hasMore = () => ids.size + pending.length < total
+
+  // `silent`: a retry after a failed first load keeps the error bar and skips the skeleton flash.
+  async function reset(silent = false) {
     const my = ++gen
     ids = new Set(); pending = []; page = 1; loaded = false
-    list.setAttribute('aria-busy', 'true')
-    list.replaceChildren(...Array.from({ length: 6 }, cfg.skeleton))
-    empty.hidden = true; more.hidden = true; newBar.hidden = true
+    if (!silent) {
+      list.setAttribute('aria-busy', 'true')
+      list.replaceChildren(...Array.from({ length: 6 }, cfg.skeleton))
+      empty.hidden = true; more.hidden = true; newBar.hidden = true
+    }
     try {
       const data = await api(url(1))
       if (my !== gen) return
       list.replaceChildren()
-      add(data.items, 'bottom')
       total = data.total
+      add(data.items, 'bottom')
       loaded = true
+      failedOnce = false
       loadedOk()
-      cfg.afterLoad?.(list)
+      cfg.afterLoad?.(list, hasMore())
     } catch {
       if (my !== gen) return
       list.replaceChildren()
+      failedOnce = true
       fail()
     }
     update()
   }
 
   async function refresh() {
-    if (!loaded) return reset()
+    if (!loaded) return reset(failedOnce)
     const my = gen
     try {
       const data = await api(url(1))
@@ -257,7 +272,7 @@ function feed(cfg) {
         if (window.scrollY > 120) pending = [...fresh, ...pending]
         else { inject([...fresh, ...pending]); pending = [] }
       }
-      cfg.afterLoad?.(list)
+      cfg.afterLoad?.(list, hasMore())
     } catch {
       if (my === gen) fail()
     }
@@ -291,6 +306,7 @@ function feed(cfg) {
       total = data.total
       add(data.items, 'bottom')
       loadedOk()
+      cfg.afterLoad?.(list, hasMore())
     } catch {
       if (my === gen) fail()
     } finally {
@@ -342,9 +358,12 @@ function feed(cfg) {
   }))
 
   // Phone: the form becomes a bottom sheet.
+  // While the sheet is open everything else is inert, so Tab stays inside the sheet.
+  const outside = () => [$('.topbar'), toggle, chips, ...[...section.children].filter((c) => !c.contains(form))]
   const setSheet = (open) => {
     section.classList.toggle('sheet-open', open)
     toggle.setAttribute('aria-expanded', String(open))
+    for (const n of outside()) n.inert = open
     if (open) form.preset.focus()
     else toggle.focus()
   }
@@ -437,12 +456,15 @@ const bookings = feed({
   noun: (n) => (n === 1 ? 'booking' : 'bookings'),
   emptyText: () => 'No bookings match these filters.',
   // Placed after every load and refresh, so it also appears for a tab left open overnight.
-  afterLoad(list) {
+  afterLoad(list, more) {
     list.querySelector('tr.divider')?.remove()
     if (!seenMark) return
     const rows = [...list.querySelectorAll('tr[data-id]')]
     const i = rows.findIndex((r) => r.dataset.at <= seenMark)
-    if (i > 0) rows[i].before(el('tr', { class: 'divider' }, el('td', { colspan: '7', text: 'New since you last looked' })))
+    const divider = (text) => el('tr', { class: 'divider' }, el('td', { colspan: '7', text }))
+    if (i > 0) rows[i].before(divider('New since you last looked'))
+    // Every row shown is new and more exist: say so, so the gap is not mistaken for the end.
+    else if (i === -1 && rows.length && more) rows.at(-1).after(divider('All of these are new since you last looked. Load more to reach the rest.'))
   },
 })
 
@@ -470,6 +492,22 @@ let reviewDecisions = 0 // bumped on every decision; a list fetched before it is
 
 const alertsOn = () => Boolean(health?.outputs && (health.outputs.telegram || health.outputs.sheets || health.outputs.whatsappSend))
 
+let reviewTotal = 0
+const reviewMore = $('.load-more', reviewSection)
+const reviewUrl = (p) => `/api/bookings?${qs({ status: 'review', page: p })}`
+const reviewCards = () => [...reviewList.querySelectorAll('.review-card[data-id]')]
+
+function updateReviewMeta() {
+  const shown = reviewCards().length
+  $('.empty', reviewSection).hidden = !reviewLoaded || shown > 0
+  reviewMore.hidden = !reviewLoaded || shown >= reviewTotal
+  const note = $('.note', reviewSection)
+  note.hidden = reviewMore.hidden
+  note.textContent = `Showing the oldest ${shown} of ${reviewTotal}.`
+  reviewKey = reviewCards().map((c) => c.dataset.id).join()
+}
+
+// Polls re-read every page already revealed (Load more), so nothing the owner opened disappears.
 async function loadReview() {
   if (!reviewLoaded) {
     reviewList.setAttribute('aria-busy', 'true')
@@ -477,9 +515,16 @@ async function loadReview() {
       el('span', { class: 'bone' }), el('span', { class: 'bone' }), el('span', { class: 'bone' }))))
   }
   const started = reviewDecisions
-  let data
+  const pages = Math.max(1, Math.ceil(reviewCards().length / 50))
+  const items = new Map()
+  let total = 0
   try {
-    data = await api(`/api/bookings?${qs({ status: 'review', page: 1 })}`)
+    for (let p = 1; p <= pages; p += 1) {
+      const data = await api(reviewUrl(p))
+      for (const i of data.items) items.set(i.id, i)
+      total = data.total
+      if (data.items.length < data.pageSize) break
+    }
   } catch {
     if (!reviewLoaded) reviewList.replaceChildren()
     errorBar(reviewSection, true, reviewOk)
@@ -489,17 +534,42 @@ async function loadReview() {
   reviewOk = new Date().toISOString()
   errorBar(reviewSection, false)
   reviewList.removeAttribute('aria-busy')
-  setBadge(data.total)
-  const key = data.items.map((i) => i.id).join()
-  if (reviewLoaded && key === reviewKey) return
+  reviewTotal = total
+  const key = [...items.keys()].join()
+  if (!reviewLoaded || key !== reviewKey) {
+    // Keep keyboard focus on the same card's same button across the re-render.
+    const active = document.activeElement
+    const focusId = reviewList.contains(active) ? active.closest('.review-card')?.dataset.id : null
+    const wasPrimary = active?.classList?.contains('primary')
+    reviewList.replaceChildren(...[...items.values()].map(reviewCard))
+    if (focusId) {
+      const card = reviewCards().find((c) => c.dataset.id === focusId)
+      ;(card?.querySelector(wasPrimary ? '.primary' : 'button:not(.primary)') || $('#h-review')).focus()
+    }
+  }
   reviewLoaded = true
-  reviewKey = key
-  reviewList.replaceChildren(...data.items.map(reviewCard))
-  $('.empty', reviewSection).hidden = data.items.length > 0
-  const note = $('.note', reviewSection)
-  note.hidden = data.total <= data.items.length
-  note.textContent = `Showing the oldest ${data.items.length} of ${data.total}. Decide these to see the rest.`
+  updateReviewMeta()
 }
+
+reviewMore.addEventListener('click', async () => {
+  const started = reviewDecisions
+  const shown = reviewCards()
+  reviewMore.disabled = true
+  try {
+    // Decisions shift offsets, so ask for the page holding the next unseen item and skip ones already shown.
+    const data = await api(reviewUrl(Math.floor(shown.length / 50) + 1))
+    if (started !== reviewDecisions) return
+    const have = new Set(shown.map((c) => c.dataset.id))
+    reviewList.append(...data.items.filter((i) => !have.has(i.id)).map(reviewCard))
+    reviewTotal = data.total
+    errorBar(reviewSection, false)
+  } catch {
+    errorBar(reviewSection, true, reviewOk)
+  } finally {
+    reviewMore.disabled = false
+    updateReviewMeta()
+  }
+})
 
 function reviewCard(b) {
   const error = el('p', { class: 'form-error' })
@@ -518,8 +588,8 @@ function reviewCard(b) {
   function removeCard() {
     const next = card.nextElementSibling || card.previousElementSibling
     card.remove()
-    reviewKey = [...reviewList.children].map((c) => c.dataset.id).join()
-    $('.empty', reviewSection).hidden = reviewList.children.length > 0
+    reviewTotal = Math.max(0, reviewTotal - 1)
+    updateReviewMeta()
     setBadge(Math.max(0, pendingCount - 1))
     return next?.querySelector('button') || $('#h-review')
   }
@@ -553,6 +623,7 @@ function reviewCard(b) {
           showToast(`Couldn't undo: ${e.message}`)
         }
         loadReview()
+        loadHealth() // the badge counts from /health
       },
       focusBack)
   }
@@ -575,8 +646,9 @@ function showToast(message, actionLabel, onAction, focusBack) {
   const button = actionLabel ? el('button', { type: 'button', text: actionLabel, onclick: () => { close(); onAction() } }) : null
   const box = el('div', { class: 'toast' }, el('span', { text: message }), button)
   region.replaceChildren(box)
-  // The acted-on button is gone, so focus is on <body>: put it on Undo. Never take it from a field being typed in.
-  if (button && focusBack && (document.activeElement === document.body || !document.activeElement)) button.focus()
+  // The acted-on button is gone: put focus on Undo, unless the owner is typing in a field.
+  const typing = document.activeElement?.matches?.('input, textarea, select, [contenteditable]')
+  if (button && focusBack && !typing) button.focus()
   // Stays while hovered or focused, so Undo can't vanish under the pointer or keyboard.
   const hide = () => { if (box.matches(':hover, :focus-within')) toastTimer = setTimeout(hide, 1000); else close() }
   toastTimer = setTimeout(hide, 6000)
@@ -639,7 +711,8 @@ const screens = {
   bookings: { show: bookings.show, refresh: bookings.refresh },
   review: { show: loadReview, refresh: loadReview },
   raw: { show: raw.show, refresh: raw.refresh },
-  status: { show: renderStatus },
+  // Show what is cached at once, then fetch fresh (a stop status must not wait for the next poll).
+  status: { show: () => { renderStatus(); return loadHealth() } },
   export: { show: countExport },
 }
 let current = null

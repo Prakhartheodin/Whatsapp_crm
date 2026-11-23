@@ -21,16 +21,18 @@ function editDistance(a, b) {
 }
 // One typo only in long letters-only words with the same first letter (Jaipur/Raipur are different cities).
 const long = new RegExp(`^\\p{L}{${PLACE_TYPO_MIN_LETTERS},}$`, 'u')
-const wordsMatch = (a, b) => a === b || (a[0] === b[0] && long.test(a) && long.test(b) && editDistance(a, b) <= 1)
+const wordsMatch = (a, b) =>
+  a === b || (a[0] === b[0] && Math.abs(a.length - b.length) <= 1 && long.test(a) && long.test(b) && editDistance(a, b) <= 1)
 
-/** Fuzzy match of two places (raw or normalised): same numbers, and enough matching words of the longer place. */
+/**
+ * Fuzzy match of two places (raw or normalised), in any word order: same numbers, every word of the shorter
+ * place found in the longer one (New/Old Delhi Railway Station differ), and those make up enough of the longer.
+ */
 export function placesMatch(a, b) {
-  const x = normalisePlace(a)?.split(' ')
-  const y = normalisePlace(b)?.split(' ')
+  const [x, y] = [normalisePlace(a)?.split(' '), normalisePlace(b)?.split(' ')].sort((p, q) => (p?.length ?? 0) - (q?.length ?? 0))
   if (!x || !y) return false
   if (x.filter(hasDigit).sort().join() !== y.filter(hasDigit).sort().join()) return false // sector 62 != 63, T1 != T3
-  const hits = x.filter((w) => y.some((v) => wordsMatch(w, v))).length
-  return hits / Math.max(x.length, y.length) >= PLACE_MATCH_MIN
+  return x.every((w) => y.some((v) => wordsMatch(w, v))) && x.length / y.length >= PLACE_MATCH_MIN
 }
 
 // Same words in the same order: case, spacing, punctuation, emoji and WhatsApp *bold*/_italic_/~strike~ ignored.

@@ -41,6 +41,7 @@ Items marked **(call)** were decided by the builder, not the owner; change freel
 │   ├── index.js               # boot: config -> output/LLM factories (fail fast) -> mongo -> spool replay +
 │   │                          #   re-feed unprocessed -> group names from mongo -> http (+ jobs) -> whatsapp
 │   ├── config.js              # read + validate env, fail fast on bad values
+│   ├── config-guard.js        # imported first by entry points: a bad value is one fatal line
 │   ├── logger.js              # pino + phone masking
 │   ├── models.js              # RawMessage, Booking, Admin
 │   ├── auth/                  # password.js (scrypt), admin.js (createAdmin)
@@ -66,6 +67,7 @@ Items marked **(call)** were decided by the builder, not the owner; change freel
 │   │   └── routes.js          # health, export, ingest, dashboard JSON
 │   └── jobs/
 │       ├── heartbeat.js
+│       ├── outbox.js          # retries outputs not yet delivered
 │       └── retention.js
 ├── frontend/                  # static dashboard served by the backend: index.html, login.html, JS, CSS
 └── test/                      # one node:test file per module (in-memory fakes, no network), plus:
@@ -197,7 +199,14 @@ Fields: `username`, `passwordHash` (`scrypt$<salt>$<hash>`), `createdAt`, `updat
 | otherSources | [{source, rawMessageId, receivedAt}] | duplicates folded into this row |
 | outputsSentAt | Date \| null | guards against double output |
 
-Indexes: `{status, receivedAt: -1}`, `{contact, receivedAt: -1}`, `{rawMessageId}` and `{otherSources.rawMessageId}` (the Raw tab's booking-status lookup, which also reports folded duplicates, and the re-feed).
+Indexes: `{status, receivedAt: -1}`, `{contact, receivedAt: -1}`, `{rawMessageId}` and `{otherSources.rawMessageId}` (the Raw tab's booking-status lookup, which also reports folded duplicates, and the re-feed), `{status, outputsSentAt}` (the outbox).
+Output delivery: `outputsSentAt` is the claim time (set once, atomically, when the booking is first
+confirmed); `delivered.{telegram,sheets,whatsappSend}` = when that output got it;
+`givenUp.{...}` = when retrying it stopped; `outputAttempts` counts sends (max 5).
+
+### ingest_keys
+`{source, clientMessageId, result, createdAt}`: `/ingest` idempotency. Unique `{source, clientMessageId}`;
+TTL index removes a row 7 days after `createdAt`. `result` is the first answer (null while processing).
 A group's source is its last known name (from MongoDB at start, then from WhatsApp); bookings stored with `whatsapp:<groupId>` are renamed once the name is known.
 `rejected` rows are kept: together with admin-confirmed rows they are labelled
 examples for tuning the rules. Bookings are not purged by retention **(call)**;
@@ -249,14 +258,22 @@ Pure function, regex-based, used when the scorer is confident. Relative dates
 A confident score (or a confident LLM answer) with missing pickup or drop is downgraded to `review`. **(call)**
 Built rules: contact = last 10 digits of an Indian mobile number (+91 / 91 / 0
 prefix, spaces or dashes); fare needs a currency or fare word (a bare number is
-not a fare); a time without a date is its next occurrence at or after
+not a fare; a list or range of fares, "6000-7000", gives none; a per-km rate such as
+"12/km" is not a fare); a time without a date is its next occurrence at or after
 `receivedAt`; a date without a time gives no `tripDateTime`. Two different values
 for a field, or an hour 1-12 without am/pm or a morning/evening word ("8 baje"),
-give `null`: a field is never guessed. Dates: 21/11, 21-11, 21.11.2026, 21 Nov.
-Date-like text the rules cannot read ("Nov 25", "25 tarikh") leaves
+give `null`: a field is never guessed. Dates: 21/11, 21/11/2026, 21-11-2026,
+21.11.2026, 21 Nov (dashes and dots only with a year: "6-7 seater" is a count).
+A slash pair after an address word ("flat 12/3") is not a date. Date-like text
+the rules cannot read ("25-11", "Nov 25", "25 tarikh") leaves
 `tripDateTime` empty instead of falling back to the next occurrence; so does
 "kal"/"tomorrow" sent between 00:00 and 04:00 IST, and an explicit date up to 7
-days in the past. Not handled yet: Devanagari script, "raat"/night times.
+days in the past. Places: each cut field leaves a line break, so a place stops at
+the next field or sentence end. The pickup may span commas ("Connaught Place, New
+Delhi to ..."). The drop ends at a comma ("Agra, one way" gives "Agra"), except
+once after a part with a number or locality word ("Sector 62, Noida"). Every
+pattern stays linear on 4000-character input; a timing test guards this.
+Not handled yet: Devanagari script, "raat"/night times.
 
 ## 7. De-duplication (`pipeline/dedupe.js`)
 A new candidate is a duplicate of an existing, non-rejected booking received
@@ -265,8 +282,8 @@ within +-24 h of its `receivedAt` when all of these hold:
   several numbers in the message);
 - `carType` and `fare` do not differ where both are present;
 - `tripDateTime` is equal to the minute when both are present;
-- and then either the `rawText` is identical after lowercasing and collapsing
-  whitespace (an exact repost), or (contact present and both trip times present)
+- and then either the `rawText` is identical after lowercasing and ignoring
+  spacing, punctuation, emoji and WhatsApp formatting (an exact repost), or (contact present and both trip times present)
   `pickupNorm` and `dropNorm` each match fuzzily.
 So a missing trip time or contact merges only an exact repost: a dispatcher's
 "Delhi to Agra kal 8 baje" and "... 10 baje" stay two bookings.
@@ -274,9 +291,11 @@ So a missing trip time or contact merges only an exact repost: a dispatcher's
 Normalisation: lowercase, strip punctuation, collapse spaces, drop filler words
 (list in `rules.js`). Fuzzy match: token-set overlap or small edit distance,
 hand-written (no library). Query narrows by `contact` + time window first, then
-compares in JS. Built: two places match when their number tokens are identical
-("sector 62" is not "sector 63", "T1" is not "T3") and at least 75% of the longer
-place's words match; words match when equal, or (letters only, 6+ letters, same
+compares in JS. Built: two places match, in any word order, when their number
+tokens are identical ("sector 62" is not "sector 63", "T1" is not "T3"), every
+word of the shorter place matches one in the longer (New and Old Delhi Railway
+Station differ), and those are at least 75% of the longer place's words ("Noida"
+is not "Noida Sector 62" or "Greater Noida"); words match when equal, or (letters only, 6+ letters, same
 first letter) one edit apart (Connaught/Conaught yes, Jaipur/Raipur no). A
 missing pickup or drop never matches. The window is +-24 h (an older copy
 processed late still folds in); the earliest match wins. Dedupe and store run one
@@ -333,9 +352,9 @@ There is no user table and no registration route.
 |---|---|---|
 | POST | `/login`, `/logout` | admin session |
 | GET | `/api/me` | `{ username }` |
-| GET | `/health` | `{ whatsapp: {status, since}, lastMessageAt, perGroup: [{id, name, lastMessageAt, countToday}], counts: {rawToday, bookingsToday, reviewPending, duplicatesToday}, heartbeat: {minutes, windowStart, windowEnd, quiet, lastAlertAt}, outputs: {sheets, telegram, whatsappSend} }`. `perGroup` falls back to the newest stored raw message after a restart |
+| GET | `/health` | `{ whatsapp: {status, since}, lastMessageAt, perGroup: [{id, name, lastMessageAt, countToday}], counts: {rawToday, bookingsToday, reviewPending, duplicatesToday, outputsPending, outputsFailed}, heartbeat: {minutes, windowStart, windowEnd, quiet, lastAlertAt}, outputs: {sheets, telegram, whatsappSend} }`. `perGroup` falls back to the newest stored raw message after a restart |
 | GET | `/export?from=&to=&source=` | streams `.xlsx` of `confirmed` bookings (cursor + streaming writer), `bookings-<from>-<to>.xlsx` (`all` when unset); times in IST |
-| POST | `/ingest` | JSON body `{source, rawText, receivedAt}`: `source` 1-100 chars, `rawText` 1-4 000 chars, `receivedAt` ISO-8601 with a time zone, at most 5 min in the future and 7 days in the past (else `400`); runs the same pipeline; returns `{status: confirmed|review|duplicate|ignored, bookingId?, duplicateOf?}` |
+| POST | `/ingest` | JSON body `{source, rawText, receivedAt}`: `source` 1-100 chars, `rawText` 1-4 000 chars, `receivedAt` ISO-8601 with a time zone, at most 5 min in the future and 7 days in the past (else `400`); runs the same pipeline; returns `{status: confirmed|review|duplicate|ignored, bookingId?, duplicateOf?}`. Optional `clientMessageId` (1-100 chars): a repeat of source + id within 7 days returns the stored answer (`409` while the first is in progress; a key without a result is freed at start and taken over after 10 min). The key's source is trimmed and lower-cased; without `clientMessageId` a request is not idempotent. 60 requests per rolling minute per credential + IP, else `429 {error, retryAfterSec}` |
 | GET | `/api/bookings?status=&from=&to=&source=&q=&page=` | paged list (50/page), returns `total`. `q` matches pickup, drop, contact or raw text (case-insensitive); `source` matches the primary source or any folded duplicate's (`otherSources`), here and in `/export` |
 | POST | `/api/bookings/:id/confirm` | review -> confirmed; fires outputs once (claims `outputsSentAt` atomically) |
 | POST | `/api/bookings/:id/reject` | review -> rejected |
@@ -363,11 +382,22 @@ max 200 chars; `/ingest` text capped at 4 000 chars). TLS is terminated by a rev
   runs a check; checks are serialized, so it is sent once). With Telegram off, alerts are logged once.
   An alert Telegram did not accept is retried at the next check.
 - **Retention** (daily, and once at boot): delete `raw_messages` older than
-  `RETENTION_DAYS` (default 30). `0` disables purging; negative or non-numeric
-  values stop the service at start. Logs the deleted count only. Bookings are kept.
+  `RETENTION_DAYS` (default 30, max 3650). `0` disables purging; other values stop
+  the service at start with one fatal line naming the variable (any malformed variable does). Logs the deleted count only. Bookings are kept.
 - Outputs (`outputs/`): Telegram and Sheets use built-in `fetch` (10 s timeout, one
   retry on 429/5xx; failures logged without URL or token, never thrown). Sheets signs
-  the service-account JWT (RS256) with `node:crypto` and caches the token.
+  the service-account JWT (RS256) with `node:crypto` and caches the token; a 401 drops it, gets a
+  new one and retries the append once.
+- **Outbox** (`jobs/outbox.js`, every 2 min and at boot): the single `onConfirmed` (pipeline and
+  dashboard confirm) counts the attempt first, then sends each output separately and records
+  `delivered.<output>` as soon as that output settles (a queued WhatsApp send never delays recording
+  Telegram/Sheets). The job re-sends, oldest first, 10 per run, only the enabled outputs not yet
+  delivered on `confirmed` bookings claimed 2 min-24 h ago with fewer than 5 attempts, skipping
+  bookings being delivered right now; each retry re-checks the stored row in the same atomic update
+  that counts the attempt, so a stale batch never re-sends. After the 5th attempt the failed outputs get `givenUp` and one error line.
+  A Sheets append with an unknown outcome (timeout/network error after sending) is given up at
+  once: a duplicate row is worse than a missing one. WhatsApp retries use the same sender queue.
+  `/health` reports `counts.outputsPending` and `counts.outputsFailed`.
 
 ## 10. Logging and privacy
 - pino JSON logs; pm2 handles files/rotation.

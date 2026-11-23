@@ -69,8 +69,31 @@ export const toBooking = (d) => ({
 // "919876543210:3@s.whatsapp.net" -> "91xxxxxxxx10"; "me" and empty stay as they are.
 const maskSender = (s) => (!s || s === 'me' ? s : maskPhone(s.split(/[:@]/)[0]))
 
-export function createRoutes({ models: { Booking, RawMessage }, config, getHealthState, onConfirmed, pipeline, logger }) {
+const INGEST_PER_MINUTE = 60
+const INGEST_KEY_STALE_MS = 10 * 60_000 // a key still without a result after this belongs to a dead request
+
+/** At start, before HTTP listens: one process, so a key without a result is an orphan of a request that died. */
+export const releaseIngestKeys = (IngestKey) => IngestKey.deleteMany({ result: null })
+const MAX_TRACKED = 10_000
+
+export function createRoutes({ models: { Booking, RawMessage, IngestKey }, config, getHealthState, onConfirmed, pipeline, logger }) {
   const r = Router()
+  const ingestHits = new Map() // credential|ip -> request times in the last 60 s; least recent key first
+
+  /** Rolling-minute limit; returns the seconds to wait, or 0 when the request may go ahead. */
+  function ingestLimited(key, t) {
+    const times = (ingestHits.get(key) ?? []).filter((x) => t - x < 60_000)
+    ingestHits.delete(key)
+    if (times.length >= INGEST_PER_MINUTE) {
+      ingestHits.set(key, times)
+      return Math.max(1, Math.ceil((times[0] + 60_000 - t) / 1000))
+    }
+    times.push(t)
+    ingestHits.set(key, times)
+    // shortcut: past MAX_TRACKED keys in a minute the least recent is forgotten (resets its limit).
+    if (ingestHits.size > MAX_TRACKED) ingestHits.delete(ingestHits.keys().next().value)
+    return 0
+  }
 
   r.get('/api/bookings', async (req, res) => {
     const status = text(req.query, 'status') ?? 'confirmed'
@@ -109,7 +132,7 @@ export function createRoutes({ models: { Booking, RawMessage }, config, getHealt
     const item = toBooking(doc)
     // outputsSentAt is claimed atomically, so outputs fire once per booking even across undo + confirm;
     // status in the filter: an undo landing between the two writes must not fire them.
-    // shortcut: claim-then-send is at-most-once (a crash or failed output is not retried); add an outbox if that bites.
+    // A failed send or a crash after the claim is retried by jobs/outbox.js, per output, never re-sending a delivered one.
     const claimed = !doc.outputsSentAt &&
       (await Booking.updateOne({ _id: doc._id, status: 'confirmed', outputsSentAt: null }, { $set: { outputsSentAt: new Date() } })).modifiedCount === 1
     if (claimed) {
@@ -130,7 +153,12 @@ export function createRoutes({ models: { Booking, RawMessage }, config, getHealt
 
   // Same pipeline as WhatsApp messages; the text lives only on the booking (not in raw_messages).
   r.post('/ingest', async (req, res) => {
-    const { source, rawText, receivedAt } = req.body ?? {}
+    const retryAfterSec = ingestLimited(`${req.user}|${req.ip}`, Date.now())
+    if (retryAfterSec) {
+      res.set('Retry-After', String(retryAfterSec))
+      return res.status(429).json({ error: 'Too many /ingest requests. Slow down.', retryAfterSec })
+    }
+    const { source, rawText, receivedAt, clientMessageId } = req.body ?? {}
     if (typeof source !== 'string' || !source.trim() || source.length > 100) throw badRequest('Invalid source: text of 1-100 characters.')
     if (typeof rawText !== 'string' || !rawText.trim() || rawText.length > 4000) throw badRequest('Invalid rawText: text of 1-4000 characters.')
     let at
@@ -142,8 +170,39 @@ export function createRoutes({ models: { Booking, RawMessage }, config, getHealt
     if (at.getTime() > Date.now() + 5 * 60_000) throw badRequest('Invalid receivedAt: more than 5 minutes in the future.')
     // Dedupe only looks 24 h around receivedAt, so a re-sent old message with a shifted time would fire outputs again.
     if (at.getTime() < Date.now() - 7 * 86_400_000) throw badRequest('Invalid receivedAt: more than 7 days in the past.')
-    const { status, bookingId, duplicateOf } = await pipeline.processMessage({ source, rawText, receivedAt: at })
-    res.json({ status, ...(bookingId && { bookingId: String(bookingId) }), ...(duplicateOf && { duplicateOf: String(duplicateOf) }) })
+    if (clientMessageId !== undefined && (typeof clientMessageId !== 'string' || !clientMessageId || clientMessageId.length > 100)) {
+      throw badRequest('Invalid clientMessageId: text of 1-100 characters.')
+    }
+    // Idempotency for collectors that re-read the same messages: the key is claimed first, so two
+    // concurrent repeats cannot both run the pipeline. Keys expire after 7 days (TTL index).
+    // Requests without clientMessageId are not idempotent.
+    const key = clientMessageId && { source: source.trim().toLowerCase(), clientMessageId }
+    if (key) {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await IngestKey.create(key)
+          break
+        } catch (err) {
+          if (err.code !== 11000) throw err
+          const prev = await IngestKey.findOne(key).lean()
+          if (prev?.result) return res.json(prev.result)
+          // A key left without a result for 10 min belongs to a request that died: take it over (atomically).
+          const freed = !attempt && (await IngestKey.deleteOne({ ...key, result: null,
+            createdAt: { $lt: new Date(Date.now() - INGEST_KEY_STALE_MS) } })).deletedCount === 1
+          if (!freed) return res.status(409).json({ error: 'This message is still being processed. Retry shortly.' })
+        }
+      }
+    }
+    let result
+    try {
+      const { status, bookingId, duplicateOf } = await pipeline.processMessage({ source, rawText, receivedAt: at })
+      result = { status, ...(bookingId && { bookingId: String(bookingId) }), ...(duplicateOf && { duplicateOf: String(duplicateOf) }) }
+    } catch (err) {
+      if (key) await IngestKey.deleteOne(key).catch(() => {}) // not processed: a retry must run again
+      throw err
+    }
+    if (key) await IngestKey.updateOne(key, { $set: { result } })
+    res.json(result)
   })
 
   r.get('/api/raw', async (req, res) => {
@@ -197,7 +256,7 @@ export function createRoutes({ models: { Booking, RawMessage }, config, getHealt
 
   r.get('/health', async (req, res) => {
     const start = istStartOfToday()
-    const { whatsapp, groupNames, lastMessageAt, heartbeat, outputs } = getHealthState()
+    const { whatsapp, groupNames, lastMessageAt, heartbeat, outputs, outputCounts } = getHealthState()
     const perGroup = await Promise.all(config.targetGroupIds.map(async (id) => {
       // After a restart the in-memory values are empty; the newest stored message fills them.
       const newest = await RawMessage.findOne({ groupId: id }).sort({ timestamp: -1 }).lean()
@@ -222,6 +281,7 @@ export function createRoutes({ models: { Booking, RawMessage }, config, getHealt
       counts: {
         rawToday, bookingsToday, reviewPending,
         duplicatesToday: withDupes.flatMap((b) => b.otherSources).filter((s) => new Date(s.receivedAt) >= start).length,
+        ...(await outputCounts()), // outputsPending, outputsFailed
       },
       heartbeat,
       outputs,

@@ -4,6 +4,9 @@ import fs from 'node:fs'
 import { createLlm } from '../backend/pipeline/llm.js'
 import { createPipeline } from '../backend/pipeline/index.js'
 import { LLM_MAX_IN_FLIGHT } from '../backend/pipeline/rules.js'
+import { score } from '../backend/pipeline/scorer.js'
+import { extract } from '../backend/pipeline/extractor.js'
+import { normalisePlace, placesMatch, findDuplicate } from '../backend/pipeline/dedupe.js'
 import { fakeBooking } from './fake-booking.js'
 
 const samples = Object.fromEntries(
@@ -298,10 +301,54 @@ test('pipeline: the same booking is merged across midnight and without a single 
   assert.equal(phones.r2.status, 'duplicate')
   assert.equal(phones.rows.length, 1)
   assert.ok(phones.sent.length <= 1)
+  const order = await pair('Noida Sector 62 to IGI T3, kal 5 am, Sedan, 9876543210', 'Sector 62, Noida to IGI T3, kal 5 am, Sedan, 9876543210')
+  assert.equal(order.r2.status, 'duplicate')
+  assert.equal(order.rows.length, 1)
   const styled = await pair('Delhi to Agra kal 8 baje, Sedan, 9876543210', '🚕 *Delhi to Agra kal 8 baje, Sedan, 9876543210* 🙏')
   assert.equal(styled.r2.status, 'duplicate')
   assert.equal(styled.rows.length, 1)
   assert.equal(styled.sent.length, 1)
+})
+
+test('pipeline: a copy with a trailing clause after the drop is the same booking', async () => {
+  for (const [a, b] of [
+    ['Delhi to Agra kal 6 am Sedan 9876543210', 'Delhi to Agra, one way, kal 6 am, Sedan, 9876543210'],
+    ['Gurgaon se Jaipur kal 6 am Dzire 9876543210', 'Gurgaon se Jaipur, one way, Dzire, kal 6 am, 9876543210'],
+    ['Delhi to Agra kal 6 am Sedan 9876543210', 'Delhi to Agra, AC car, kal 6 am, Sedan, 9876543210'],
+  ]) {
+    const { r1, r2, rows, sent } = await pair(a, b)
+    assert.equal(r1.status, 'confirmed', a)
+    assert.equal(r2.status, 'duplicate', b)
+    assert.equal(rows.length, 1)
+    assert.equal(sent.length, 1)
+  }
+})
+
+test('pipeline: adversarial 4000-character messages are processed fast (no regex blow-up)', async () => {
+  const N = 4000
+  const inputs = {
+    'cab x1000': 'cab '.repeat(1000), 'kal x1000': 'kal '.repeat(1000), '1-2 x1000': '1-2 '.repeat(1000),
+    'x + newlines': 'x' + '\n '.repeat(1999), '6 am x800': '6 am '.repeat(800), 'Sedan x666': 'Sedan '.repeat(666),
+    'digits': '9'.repeat(N), 'spaced digits': '9 '.repeat(N / 2), 'dashed digits': '9-'.repeat(N / 2),
+    'separators': ',;:.!?-/'.repeat(N / 8), 'to x1333': 'to '.repeat(1333), 'a to x800': 'a to '.repeat(800),
+    'commas': ', '.repeat(N / 2), 'word commas': 'Noida, '.repeat(N / 7), 'emoji': '🚕'.repeat(N / 2),
+    'spaces': 'a' + ' '.repeat(N - 2) + 'b', 'pickup x570': 'pickup '.repeat(570), 'drop to x500': 'drop to '.repeat(500),
+    'fare list': 'fare ' + '1000 '.repeat(799), 'per km': '12 '.repeat(1333) + '/km', 'flat x800': 'flat '.repeat(800) + '12/3',
+    'mixed': ('Delhi to Agra, kal 6 am, Sedan, Rs 2500, 9876543210\n').repeat(80),
+  }
+  extract('warm up Delhi to Agra kal 6 am', T)
+  for (const [name, text] of Object.entries(inputs)) {
+    const t = text.slice(0, N)
+    const t0 = performance.now()
+    score(t)
+    const e = extract(t, T)
+    normalisePlace(t)
+    placesMatch(e.pickup, e.drop)
+    placesMatch(t.slice(0, 200), t.slice(0, 200))
+    await findDuplicate(fakeBooking([{ _id: 'b', contact: e.contact, rawText: t, receivedAt: T, status: 'review' }]), { ...e, rawText: t, receivedAt: T })
+    const ms = performance.now() - t0
+    assert.ok(ms < 250, `${name}: ${ms.toFixed(0)} ms`)
+  }
 })
 
 test('pipeline: a confirmed copy promotes a Review row once, fills its gaps, fires outputs once', async () => {

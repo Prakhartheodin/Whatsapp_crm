@@ -64,6 +64,8 @@ export function createSender(config, { getSock, logger, sleep = delay, random = 
 
   return Object.freeze({
     enabled: true,
+    /** Messages waiting or being sent (lost if the process stops now). */
+    pending: () => pending,
     send(text) {
       if (pending >= MAX_QUEUE) {
         logger.warn('whatsapp send queue full; message dropped')

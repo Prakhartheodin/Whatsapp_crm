@@ -6,7 +6,11 @@ import { call, ist } from './common.js'
 const TOKEN_URL = 'https://oauth2.googleapis.com/token'
 const SCOPE = 'https://www.googleapis.com/auth/spreadsheets'
 
-/** Google Sheets append with a service account. append(booking) -> true | false; never throws. */
+/**
+ * Google Sheets append with a service account. append(booking) -> true (written), false (not
+ * written: safe to retry) or 'unknown' (timeout/network error after sending: may be written,
+ * so the caller must not retry). Never throws.
+ */
 export function createSheets(config, { fetch = globalThis.fetch, logger, now = () => new Date(), sleep = delay }) {
   if (!config.sheetsEnabled) return { enabled: false, append: async () => false }
   if (!config.googleSheetId) throw new Error('GOOGLE_SHEET_ID: required when SHEETS_ENABLED=true')
@@ -32,7 +36,7 @@ export function createSheets(config, { fetch = globalThis.fetch, logger, now = (
     const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url')
     const unsigned = `${b64({ alg: 'RS256', typ: 'JWT' })}.${b64({ iss: email, scope: SCOPE, aud: TOKEN_URL, iat, exp: iat + 3600 })}`
     const assertion = `${unsigned}.${crypto.sign('RSA-SHA256', Buffer.from(unsigned), key).toString('base64url')}`
-    const body = await call(fetch, TOKEN_URL, {
+    const { body } = await call(fetch, TOKEN_URL, {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion }).toString(),
@@ -47,19 +51,24 @@ export function createSheets(config, { fetch = globalThis.fetch, logger, now = (
     enabled: true,
     async append(b) {
       try {
-        const t = await accessToken()
-        if (!t) return false
         // RAW: strings stay strings, so a message starting with "=" is never a formula.
         // Google rejects a cell over 50 000 chars, which would lose the whole row.
         const row = [ist(b.receivedAt), ist(b.tripDateTime), b.pickup ?? '', b.drop ?? '', b.carType ?? '', b.fare ?? '',
           b.contact ?? '', b.source ?? '', b.confidence ?? '', b.rawText ?? ''].map((c) => (typeof c === 'string' ? c.slice(0, 50_000) : c))
-        const res = await call(fetch, url, {
-          method: 'POST',
-          headers: { authorization: `Bearer ${t}`, 'content-type': 'application/json' },
-          body: JSON.stringify({ values: [row] }),
-        }, opts)
-        if (res === null) token = null // a revoked token is not reused until it expires
-        return res !== null
+        for (let attempt = 0; ; attempt++) {
+          const t = await accessToken()
+          if (!t) return false
+          const res = await call(fetch, url, {
+            method: 'POST',
+            headers: { authorization: `Bearer ${t}`, 'content-type': 'application/json' },
+            body: JSON.stringify({ values: [row] }),
+          }, opts)
+          if (res.ok) return true
+          token = null // a revoked token is not reused until it expires
+          if (res.unknown) return 'unknown'
+          if (res.status !== 401 || attempt) return false
+          // 401: the cached token was rejected; one retry with a fresh one (nothing was written).
+        }
       } catch (err) {
         logger.error({ output: 'sheets', error: err.name }, 'output failed')
         return false

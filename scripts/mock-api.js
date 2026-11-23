@@ -81,7 +81,7 @@ const health = () => ({
     { id: groups[2].id, name: 'Group C', lastMessageAt: ago(16), countToday: 22 },
     { id: groups[3].id, name: 'Group D', lastMessageAt: ago(60 * 3 + 5), countToday: 4 }, // quiet group
   ],
-  counts: { rawToday: 105, bookingsToday: bookings.filter((b) => b.status === 'confirmed').length, reviewPending: bookings.filter((b) => b.status === 'review').length, duplicatesToday: 2 },
+  counts: { rawToday: 105, bookingsToday: bookings.filter((b) => b.status === 'confirmed').length, reviewPending: bookings.filter((b) => b.status === 'review').length, duplicatesToday: 2, outputsPending: 2, outputsFailed: 1 },
   heartbeat: { minutes: 120, windowStart: '08:00', windowEnd: '23:00', quiet: Boolean(process.env.MOCK_QUIET), lastAlertAt: process.env.MOCK_QUIET ? ago(10) : null },
   outputs,
 })

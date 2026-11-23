@@ -79,7 +79,7 @@ backend/            the service
                     send.js (the only sending code; off by default)
   pipeline/         rules.js (placeholder keywords), scorer.js, extractor.js, llm.js, dedupe.js, index.js
   outputs/          telegram.js, sheets.js, index.js (fan-out per confirmed booking)
-  jobs/             heartbeat.js, retention.js
+  jobs/             heartbeat.js, retention.js, outbox.js (output retries)
   auth/             password.js (scrypt), admin.js (single admin account)
   http/             server.js, auth.js (session + token), routes.js
 frontend/           dashboard (login.html, index.html, app.js, api.js, format.js, app.css)
@@ -122,7 +122,7 @@ Copy `.env.example` to `.env`; its comments explain each value. Booleans are `tr
 | `LOG_LEVEL` | no | Default `info`; phone numbers are masked at `info` and above |
 | `HEARTBEAT_MINUTES` | no | Default 120. Telegram alert after this long without any group message (08:00-23:00 IST) |
 | `SESSION_DOWN_ALERT_MINUTES` | no | Default 10. Telegram alert when WhatsApp is not connected this long |
-| `RETENTION_DAYS` | no | Default 30. Raw messages older than this are deleted daily; `0` keeps them forever |
+| `RETENTION_DAYS` | no | Default 30, at most 3650. Raw messages older than this are deleted daily; `0` keeps them forever |
 | `TELEGRAM_ENABLED` | no | Default `false`. Booking and heartbeat alerts to Telegram |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | when Telegram is on | Bot token from @BotFather; the chat or group to post to |
 | `SHEETS_ENABLED` | no | Default `false`. One Google Sheets row per confirmed booking |
@@ -135,8 +135,8 @@ Copy `.env.example` to `.env`; its comments explain each value. Booleans are `tr
 | `LLM_CONFIRM_THRESHOLD` | no | Default 0.8. LLM confidence needed to confirm; lower goes to Review |
 
 An enabled output or LLM with a missing setting stops the service at start with one `fatal` log
-line naming the variable. A malformed value (e.g. `TELEGRAM_ENABLED=yes`, `RETENTION_DAYS=-1`)
-stops it with an error naming the variable.
+line naming the variable. So does a malformed value (e.g. `TELEGRAM_ENABLED=yes`, `RETENTION_DAYS=-1`),
+for the service and for `npm run groups` / `npm run create-admin`.
 
 ## HTTP API
 
@@ -162,6 +162,16 @@ zone, at most 5 minutes in the future and 7 days in the past. It answers `{ stat
 `status` one of `confirmed`, `review`, `duplicate`, `ignored`, or `400 { error }` for a bad
 body. The text is kept on the booking only, not in raw messages.
 
+- Optional `clientMessageId` (1-100 characters): a collector that may send the same message twice
+  sets it to a stable id per message. A repeat of the same `source` (case and surrounding spaces
+  ignored) + `clientMessageId` within 7 days returns the first answer without running the pipeline
+  again (`409` while the first is still being processed: retry shortly). An id whose request died
+  (service restart, error) is freed at the next start, or after 10 minutes. A request without
+  `clientMessageId` is not idempotent: sending it twice processes it twice (de-duplication may
+  still fold the copy).
+- Rate limit: 60 requests per rolling minute per credential (API token or login) and client IP;
+  over it, `429 { error, retryAfterSec }` with a `Retry-After` header.
+
 ```
 curl -X POST http://localhost:3000/ingest \
   -H "content-type: application/json" \
@@ -185,9 +195,26 @@ Details and response shapes are in [design.md](design.md) section 8.
 
 ## Outputs
 
-Each confirmed booking (confirmed by the rules, the LLM, or you in Review) is sent once to every
+Each confirmed booking (confirmed by the rules, the LLM, or you in Review) is sent to every
 enabled output. Review items are not sent. One output failing is logged and does not stop the
-others; a failed send is not retried later.
+others. Each booking records, per output, when that output got it (as soon as that output is
+done, not after the slowest one), so each output gets a booking at most once, except after a crash
+in the instant between sending and recording it.
+
+Retries: every 2 minutes (and at start) the service re-sends, per booking, only the enabled
+outputs that have not got it yet. That covers a failed send and a crash or restart between
+confirming and sending. Limits:
+
+- At most 5 attempts per booking; then one `error` log line names the booking and the outputs that
+  failed, and it is shown as failed on the Status screen (`/health` `counts.outputsFailed`).
+  Bookings still being retried are `counts.outputsPending`.
+- Only bookings confirmed in the last 24 hours are retried. Turning an output on later also sends
+  it the bookings confirmed in the last 24 hours that it never got.
+- Google Sheets is retried only when Google answered with an error (nothing was written). After a
+  timeout or network error the row may have been written, so that booking's Sheets row is given up
+  (logged, counted as failed) rather than risk a duplicate. Telegram and WhatsApp send are retried.
+- Undo (back to Review) stops the retries; confirming again sends only what is still missing.
+- WhatsApp retries go through the same sender queue and limits as first sends.
 
 **Telegram.** Create a bot with @BotFather and copy its token into `TELEGRAM_BOT_TOKEN`. Send the
 bot a message (or add it to a group and post there), open
@@ -212,7 +239,9 @@ Values are written as plain text, so a message starting with `=` is never run as
 the main ban risk; leave it off unless you need it. When on, it sends the booking alert only to
 `TARGET_NUMBER` (the code cannot send anywhere else), waits a random 3-8 s before each message,
 sends at most 10 per minute, queues up to 100 more (extras are dropped with a warning) and skips
-a message while the session is not connected. The queue is in memory: a restart loses it.
+a message while the session is not connected. The queue is in memory: a restart drops it (the
+count is logged) and the retries above send those messages again. The target number is logged,
+masked, at start.
 
 ## Booking detection and samples
 
@@ -374,8 +403,8 @@ server {
 
 `POST /ingest` answers once the message has been through the pipeline. With the LLM on and a
 backlog queued, that can take longer than nginx's default 60 s `proxy_read_timeout`; the client
-then gets a 504 although the booking is still stored. Raise the timeout or retry with care (a
-retry of a booking without a phone number is not recognised as a duplicate).
+then gets a 504 although the booking is still stored. Raise the timeout, and send a
+`clientMessageId` so a retry is recognised.
 
 The `X-Forwarded-For` line matters. The login limit counts failed passwords per client IP.
 Without that header every visitor looks like the same IP, so 5 bad passwords from anyone lock
@@ -441,10 +470,13 @@ link, then start pm2 again.
   drop that batch. The window is short; it is library behaviour.
 - A message that cannot be decrypted is logged as a warning (`no readable content`) with its group
   and message ID. WhatsApp usually resends it; if not, it is missing.
-- Outputs are sent at most once: a send that fails, or a crash between confirming a booking and
-  sending, is logged and not retried.
+- Output retries stop after 5 attempts or 24 hours; a Sheets row whose write timed out is not
+  retried (see [Outputs](#outputs)).
 - A stored message that did not finish the booking pipeline (restart, MongoDB error) is fed again
   at the next start or MongoDB reconnect, but only for 48 hours; older ones stay in Raw messages only.
 - Messages longer than 4000 characters are classified from their first 4000 (the full text stays in
   Raw messages). A group name longer than 91 characters is cut in the booking source.
-- The WhatsApp send queue and the pipeline queue live in memory; the send queue is lost on restart.
+- The WhatsApp send queue and the pipeline queue live in memory; both are recovered after a restart
+  (outbox retries, pipeline re-feed) within the limits above. Only the outputs not yet recorded as
+  delivered are sent again.
+- The `/ingest` rate limit is per process and in memory (a restart resets it).

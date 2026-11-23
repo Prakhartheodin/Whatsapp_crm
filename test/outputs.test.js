@@ -181,8 +181,11 @@ test('sheets: failures return false, never throw; 5xx retried once, 403 not', as
   assert.equal(await createSheets(config, { fetch: f2, logger, sleep: noSleep() }).append(booking), false)
   assert.equal(f2.calls.length, 2)
   const f4 = fakeFetch(token, new TypeError('fetch failed'))
-  assert.equal(await createSheets(config, { fetch: f4, logger, sleep: noSleep() }).append(booking), false)
+  assert.equal(await createSheets(config, { fetch: f4, logger, sleep: noSleep() }).append(booking), 'unknown',
+    'the row may have been written: never retried, reported as unknown')
   assert.equal(f4.calls.length, 2, 'append not retried on a network error (could duplicate the row)')
+  const f5 = fakeFetch(new TypeError('fetch failed')) // the token request: nothing was written
+  assert.equal(await createSheets(config, { fetch: f5, logger, sleep: noSleep() }).append(booking), false)
   const f3 = fakeFetch(json({ error: 'invalid_grant' }, 400))
   assert.equal(await createSheets(config, { fetch: f3, logger, sleep: noSleep() }).append(booking), false)
   assert.equal(f3.calls.length, 1)
@@ -239,4 +242,30 @@ test('outputs: fans out to enabled outputs; one failing never blocks the others 
   const doc = new Booking({ source: 'G', rawText: 'x', receivedAt: new Date(), status: 'confirmed', decidedBy: 'rules' })
   assert.deepEqual(await ok.onConfirmed(doc), { telegram: true, sheets: null, whatsappSend: null })
   assert.equal(quiet.lines.length, 0)
+})
+
+test('sheets: a 401 drops the cached token, gets a new one and retries the append once', async () => {
+  const { config } = await sheetsSetup()
+  const token = (t) => () => json({ access_token: t, expires_in: 3600 })
+  const unauth = json({ error: { message: 'Request had invalid authentication credentials.' } }, 401)
+  const f = fakeFetch(token('old'), unauth, token('new'), json({}))
+  const sheets = createSheets(config, { fetch: f, logger: fakeLogger(), sleep: noSleep() })
+  assert.equal(await sheets.append(booking), true)
+  assert.deepEqual(f.calls.map((c) => c.init.headers.authorization ?? 'token'), ['token', 'Bearer old', 'token', 'Bearer new'])
+  const g = fakeFetch(token('a'), unauth, token('b'), json({ error: {} }, 401))
+  assert.equal(await createSheets(config, { fetch: g, logger: fakeLogger(), sleep: noSleep() }).append(booking), false)
+  assert.equal(g.calls.length, 4, 'only one retry')
+})
+
+test('outputs: only sends the named outputs; an unknown Sheets outcome is passed through', async () => {
+  const sent = []
+  const outputs = createOutputs({
+    telegram: { enabled: true, send: async () => { sent.push('t'); return true } },
+    sheets: { enabled: true, append: async () => { sent.push('s'); return 'unknown' } },
+    sender: { enabled: true, send: async () => { sent.push('w'); return true } },
+    logger: fakeLogger(),
+  })
+  assert.deepEqual(await outputs.onConfirmed(booking, { only: ['telegram'] }), { telegram: true, sheets: null, whatsappSend: null })
+  assert.deepEqual(sent, ['t'])
+  assert.deepEqual(await outputs.onConfirmed(booking), { telegram: true, sheets: 'unknown', whatsappSend: true })
 })

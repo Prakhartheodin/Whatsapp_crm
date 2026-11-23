@@ -12,10 +12,10 @@ function only(vals) {
   return u.size === 0 ? undefined : u.size === 1 && !u.has('null') ? vals[0] : null
 }
 
-// Replaces each match with a separator (so places are read from what is left) and returns fn(match) for each.
+// Replaces each match with a line break (so a place stops at the next field) and returns fn(match) for each.
 function cut(s, re, fn) {
   const out = []
-  s.text = s.text.replace(all(re), (...m) => { out.push(fn(m)); return ' , ' })
+  s.text = s.text.replace(all(re), (...m) => { out.push(fn(m)); return ' \n ' })
   return out
 }
 
@@ -48,8 +48,13 @@ function minutes(hs, ms, suffix, context) {
   else if (!(h <= 23 && (h > 12 || h === 0 || hs.startsWith('0')))) return null
   return min > 59 ? null : h * 60 + min
 }
+// The drop ends at a comma ("Agra, one way"), except one comma after a sub-locality ("Sector 62, Noida").
+function dropPart(place) {
+  const parts = place?.split(',') ?? []
+  return parts.length > 1 && R.SUB_LOCALITY.test(parts[0]) ? `${parts[0]},${parts[1]}` : parts[0]
+}
 function clean(place) {
-  const p = place?.replace(/\s+/g, ' ').replace(/^[\s-]+|[\s-]+$/g, '')
+  const p = place?.replace(/\s+/g, ' ').replace(/\s+,/g, ',').replace(/^[\s,-]+|[\s,-]+$/g, '')
   return p && /\p{L}/u.test(p) && p.length <= R.FIELD_MAX_CHARS && p.split(' ').length <= R.PLACE_MAX_WORDS ? p : null
 }
 
@@ -64,10 +69,13 @@ export function extract(text, receivedAt) {
   const context = am && !pm ? 'am' : pm && !am ? 'pm' : null
 
   const contact = only(cut(s, R.PHONE, (m) => m[0].replace(/\D/g, '').slice(-10)))
-  const fare = only([...cut(s, R.FARE_BEFORE, (m) => m[1]), ...cut(s, R.FARE_AFTER, (m) => m[1])].map((v) => {
-    const n = Number(v.replace(/,/g, ''))
-    return n >= R.FARE_MIN && n <= R.FARE_MAX ? n : null
-  }))
+  cut(s, R.PER_KM, () => 0)
+  // each match may be a list or range ("6000-7000"): every number in it is a candidate
+  const fare = only([...cut(s, R.FARE_BEFORE, (m) => m[1]), ...cut(s, R.FARE_AFTER, (m) => m[1])]
+    .flatMap((v) => v.split(/[^\d,]+/).filter((n) => /\d/.test(n))).map((v) => {
+      const n = Number(v.replace(/,/g, ''))
+      return n >= R.FARE_MIN && n <= R.FARE_MAX ? n : null
+    }))
   const date = only([
     ...cut(s, R.NUMERIC_DATE, (m) => explicitDay(today, m[1] ?? m[4], +(m[2] ?? m[6]) - 1, m[3] ?? m[7])),
     ...cut(s, R.TEXT_DATE, (m) => explicitDay(today, m[1], R.MONTHS.indexOf(m[2].slice(0, 3).toLowerCase()))),
@@ -98,10 +106,11 @@ export function extract(text, receivedAt) {
   const carType = only(cut(s, R.CAR_TYPE, (m) => R.CAR_TYPES.find((c) => c.toLowerCase() === m[0].toLowerCase().replace(/\s+/g, ' '))))
   cut(s, R.NOISE, () => 0)
 
-  const labelled = [clean(s.text.match(R.PICKUP_LABEL)?.[1]), clean(s.text.match(R.DROP_LABEL)?.[1])]
+  const labelled = [clean(s.text.match(R.PICKUP_LABEL)?.[1]), clean(dropPart(s.text.match(R.DROP_LABEL)?.[1]))]
   const [pickup, drop] = labelled[0] || labelled[1]
     ? labelled
-    : only([...s.text.matchAll(all(R.ROUTE))].map((m) => [clean(m[1]), clean(m[2])])) ?? [null, null]
+    // a side that still holds "to"/"se" is two routes run together ("Delhi to Agra, Agra to Mathura"): ambiguous
+    : only([...s.text.matchAll(all(R.ROUTE))].map((m) => (R.ROUTE_WORD.test(m[2]) ? null : [clean(m[1]), clean(dropPart(m[2]))]))) ?? [null, null]
 
   return { pickup, drop, tripDateTime, carType: carType ?? null, fare: fare ?? null, contact: contact ?? null }
 }

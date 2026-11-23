@@ -1,9 +1,11 @@
 // npm run groups: print every group the linked number is in (name + ID).
 // Stop the main service first: two sockets on one session knock each other out.
 // Needs no MongoDB, so it is also the easiest way to link the number the first time.
+import { configLoaded } from '../backend/config-guard.js' // first: a malformed .env value is one fatal line
 import { quietConsole } from '../backend/logger.js'
 import { startWhatsApp, flushCreds } from '../backend/whatsapp/connection.js'
 
+configLoaded()
 quietConsole()
 await startWhatsApp({
   onStop: async () => {

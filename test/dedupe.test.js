@@ -47,6 +47,16 @@ test('placesMatch', () => {
   assert.equal(placesMatch('Patna', 'Panna'), false)
   assert.equal(placesMatch('Mumbai', 'Mumbra'), false) // 6 letters, but 2 edits
   assert.equal(placesMatch('Gurgaon', 'Gurgaun'), true)
+  // word order and commas do not matter; a missing or different part does
+  assert.equal(placesMatch('Sector 62, Noida', 'Noida Sector 62'), true)
+  assert.equal(placesMatch('Noida Sector 62', 'Noida Sector 63'), false)
+  assert.equal(placesMatch('Noida', 'Noida Sector 62'), false) // a strict subset may be a different trip
+  assert.equal(placesMatch('Noida', 'Greater Noida'), false)
+  assert.equal(placesMatch('Connaught Place', 'Connaught Place, New Delhi'), false)
+  // every word of the shorter place must match: one differing word in long names is a different place
+  assert.equal(placesMatch('New Delhi Railway Station', 'Old Delhi Railway Station'), false)
+  assert.equal(placesMatch('North Campus Gate Delhi', 'South Campus Gate Delhi'), false)
+  assert.equal(placesMatch('IGI Airport T3', 'IGI Airport Terminal T3'), true)
   assert.equal(placesMatch(null, null), false)
   assert.equal(placesMatch('delhi', null), false)
 })

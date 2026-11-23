@@ -4,76 +4,9 @@ import { createHmac } from 'node:crypto'
 import ExcelJS from 'exceljs'
 import { createApp } from '../backend/http/server.js'
 import { hashPassword } from '../backend/auth/password.js'
-import { toBooking } from '../backend/http/routes.js'
+import { toBooking, releaseIngestKeys } from '../backend/http/routes.js'
 import { Booking } from '../backend/models.js'
-
-// ---- in-memory stand-ins for the Mongoose models (only the calls the routes make) ----
-const get = (o, path) =>
-  path.split('.').reduce((v, k) => (Array.isArray(v) ? v.map((x) => x?.[k]) : v?.[k]), o)
-const OPS = {
-  $gte: (v, x) => v >= x,
-  $lte: (v, x) => v <= x,
-  $lt: (v, x) => v < x,
-  $ne: (v, x) => String(v) !== String(x),
-  $in: (v, x) => x.map(String).includes(String(v)),
-  $regex: (v, x, c) => new RegExp(x, c.$options).test(v),
-  $options: () => true,
-}
-const one = (v, c) =>
-  c && typeof c === 'object' && !(c instanceof Date)
-    ? v != null && Object.entries(c).every(([op, x]) => OPS[op](v, x, c))
-    : c === null ? v == null : String(v) === String(c)
-const match = (d, f) =>
-  Object.entries(f).every(([k, c]) => {
-    if ((k === '$or' || k === '$and') && !c.length) throw new Error(`${k} must be a nonempty array`) // as MongoDB
-    if (k === '$or') return c.some((sub) => match(d, sub))
-    if (k === '$and') return c.every((sub) => match(d, sub))
-    const v = get(d, k)
-    return Array.isArray(v) ? v.some((e) => one(e, c)) : one(v, c)
-  })
-
-function query(rows, single = false) {
-  const q = {
-    sort(s) {
-      const keys = Object.entries(s)
-      const cmp = (a, b, dir) => (a < b ? -dir : a > b ? dir : 0)
-      rows = [...rows].sort((a, b) => keys.reduce((r, [k, dir]) => r || cmp(a[k], b[k], dir), 0))
-      return q
-    },
-    skip(n) { rows = rows.slice(n); return q },
-    limit(n) { rows = rows.slice(0, n); return q },
-    lean() { return q },
-    async *cursor() { yield* structuredClone(rows) },
-    then(res, rej) {
-      return Promise.resolve(structuredClone(single ? rows[0] ?? null : rows)).then(res, rej)
-    },
-  }
-  return q
-}
-
-function fakeModel(docs = []) {
-  const m = {
-    docs,
-    find: (f = {}) => query(docs.filter((d) => match(d, f))),
-    findOne: (f = {}) => query(docs.filter((d) => match(d, f)), true),
-    findById: (id) => m.findOne({ _id: id }),
-    countDocuments: async (f = {}) => docs.filter((d) => match(d, f)).length,
-    exists: async (f) => (docs.some((d) => match(d, f)) ? { _id: 'x' } : null),
-    findOneAndUpdate(f, u, o = {}) {
-      const d = docs.find((x) => match(x, f))
-      if (!d) return query([], true)
-      const before = structuredClone(d)
-      Object.assign(d, u.$set)
-      return query([o.returnDocument === 'after' ? d : before], true)
-    },
-    async updateOne(f, u) {
-      const d = docs.find((x) => match(x, f))
-      if (d) Object.assign(d, u.$set)
-      return { matchedCount: d ? 1 : 0, modifiedCount: d ? 1 : 0 }
-    },
-  }
-  return m
-}
+import { fakeModel } from './fake-model.js'
 
 // ---- fixtures ----
 const PW = 'correct horse battery'
@@ -105,6 +38,7 @@ async function start(t) {
       booking(4, 'rejected', 'admin'),
       booking(5, 'confirmed', 'admin', { source: 'app', tripDateTime: new Date('2026-11-24T00:30:00Z') }),
     ]),
+    IngestKey: fakeModel([], { unique: ['source', 'clientMessageId'] }),
     RawMessage: fakeModel([
       { _id: id(901), messageId: 'A', groupId: GROUP, groupName: 'Cabs', sender: '919876543210@s.whatsapp.net', text: 'hello', timestamp: ago(10) },
       { _id: id(902), messageId: 'B', groupId: GROUP, groupName: 'Cabs', sender: 'me', text: 'mine', timestamp: ago(5) },
@@ -119,6 +53,7 @@ async function start(t) {
       whatsapp: { status: 'open', since: new Date(now) }, groupNames: new Map(), lastMessageAt: new Map(),
       heartbeat: { minutes: 120, windowStart: '08:00', windowEnd: '23:00', quiet: true, lastAlertAt: new Date(now) },
       outputs: { sheets: true, telegram: false, whatsappSend: false },
+      outputCounts: async () => ({ outputsPending: 2, outputsFailed: 1 }),
     }),
     onConfirmed: (b) => confirmed.push(b),
     pipeline: {
@@ -492,7 +427,7 @@ test('/health shape, "today" starts at IST midnight', async (t) => {
   assert.equal(h.whatsapp.status, 'open')
   assert.equal(h.lastMessageAt, after.toISOString())
   assert.deepEqual(h.perGroup, [{ id: GROUP, name: 'Cabs', lastMessageAt: after.toISOString(), countToday: 1 }])
-  assert.deepEqual(h.counts, { rawToday: 1, bookingsToday: 1, reviewPending: 2, duplicatesToday: 1 })
+  assert.deepEqual(h.counts, { rawToday: 1, bookingsToday: 1, reviewPending: 2, duplicatesToday: 1, outputsPending: 2, outputsFailed: 1 })
   // Injected heartbeat state and outputs status are passed through.
   assert.deepEqual(h.heartbeat, { minutes: 120, windowStart: '08:00', windowEnd: '23:00', quiet: true, lastAlertAt: new Date(now).toISOString() })
   assert.deepEqual(h.outputs, { sheets: true, telegram: false, whatsappSend: false })
@@ -555,4 +490,68 @@ test('toBooking gives outputs the same shape from a Mongoose document as from a 
   assert.deepEqual(fromDoc, toBooking(doc.toObject()))
   assert.equal(fromDoc.id, String(doc._id))
   assert.deepEqual(fromDoc.otherSources, [{ source: 'app', receivedAt: ago(1) }])
+})
+
+test('POST /ingest: 60 per rolling minute per credential and IP, then 429 with retryAfterSec', async (t) => {
+  const { call, ingested, login } = await start(t)
+  const body = { source: 'app', rawText: 'ignored', receivedAt: new Date().toISOString() }
+  for (let i = 0; i < 60; i++) assert.equal((await call('/ingest', { method: 'POST', body })).status, 200, String(i))
+  const res = await call('/ingest', { method: 'POST', body })
+  assert.equal(res.status, 429)
+  const err = await res.json()
+  assert.equal(typeof err.error, 'string')
+  assert.ok(err.retryAfterSec > 0 && err.retryAfterSec <= 60)
+  assert.equal(res.headers.get('retry-after'), String(err.retryAfterSec))
+  assert.equal(ingested.length, 60)
+  // The dashboard session is a different credential with its own budget.
+  const cookie = (await login('boss', PW)).headers.get('set-cookie').split(';')[0]
+  assert.equal((await call('/ingest', { method: 'POST', body, auth: false, headers: { cookie } })).status, 200)
+})
+
+test('POST /ingest: a repeated source + clientMessageId returns the first result without running the pipeline', async (t) => {
+  const { call, ingested, models } = await start(t)
+  const body = { source: 'app', rawText: 'confirmed', receivedAt: new Date().toISOString(), clientMessageId: 'msg-1' }
+  const first = await (await call('/ingest', { method: 'POST', body })).json()
+  assert.deepEqual(first, INGEST_RESULTS.confirmed)
+  const again = await call('/ingest', { method: 'POST', body: { ...body, rawText: 'review' } })
+  assert.equal(again.status, 200)
+  assert.deepEqual(await again.json(), first)
+  assert.equal(ingested.length, 1)
+  // Same id from another source, or no id at all: processed normally.
+  await call('/ingest', { method: 'POST', body: { ...body, source: 'app2' } })
+  await call('/ingest', { method: 'POST', body: { ...body, clientMessageId: undefined } })
+  assert.equal(ingested.length, 3)
+  assert.equal(models.IngestKey.docs.length, 2)
+  // Bad ids are rejected; a pipeline 400 frees the id for a corrected retry.
+  for (const clientMessageId of ['', 'x'.repeat(101), 5]) {
+    assert.equal((await call('/ingest', { method: 'POST', body: { ...body, clientMessageId } })).status, 400)
+  }
+  const bad = { ...body, clientMessageId: 'msg-2', rawText: 'rejected by pipeline' }
+  assert.equal((await call('/ingest', { method: 'POST', body: bad })).status, 400)
+  assert.equal((await call('/ingest', { method: 'POST', body: { ...bad, rawText: 'review' } })).status, 200)
+  // A repeat while the first is still being processed is told to retry.
+  models.IngestKey.docs.push({ source: 'app', clientMessageId: 'busy', result: null, createdAt: ago(1) })
+  assert.equal((await call('/ingest', { method: 'POST', body: { ...body, clientMessageId: 'busy' } })).status, 409)
+  // ...but a key left without a result for over 10 minutes (its request died) is taken over.
+  models.IngestKey.docs.push({ source: 'app', clientMessageId: 'orphan', result: null, createdAt: ago(11) })
+  const before = ingested.length
+  const took = await call('/ingest', { method: 'POST', body: { ...body, clientMessageId: 'orphan' } })
+  assert.equal(took.status, 200)
+  assert.deepEqual(await took.json(), INGEST_RESULTS.confirmed)
+  assert.equal(ingested.length, before + 1)
+  assert.deepEqual(models.IngestKey.docs.filter((d) => d.clientMessageId === 'orphan').map((d) => d.result), [INGEST_RESULTS.confirmed])
+  // The key's source is case- and space-insensitive (the booking keeps the source as sent).
+  const n = ingested.length
+  const same = await call('/ingest', { method: 'POST', body: { ...body, source: ' APP ' } })
+  assert.deepEqual(await same.json(), first)
+  assert.equal(ingested.length, n)
+})
+
+test('releaseIngestKeys: at start, keys without a result (their request died with the process) are freed', async () => {
+  const IngestKey = fakeModel([
+    { source: 'app', clientMessageId: 'a', result: null },
+    { source: 'app', clientMessageId: 'b', result: { status: 'ignored' } },
+  ])
+  await releaseIngestKeys(IngestKey)
+  assert.deepEqual(IngestKey.docs.map((d) => d.clientMessageId), ['b'])
 })

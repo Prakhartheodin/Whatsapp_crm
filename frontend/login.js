@@ -23,7 +23,14 @@ form.addEventListener('submit', async (e) => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password }),
     })
-    if (res.ok) return location.assign(target)
+    if (res.ok) {
+      // A Secure cookie over plain HTTP is dropped silently: check the session actually stuck.
+      const me = await fetch('/api/me', { credentials: 'same-origin' })
+      if (me.ok) return location.assign(target)
+      error.textContent = 'Login worked, but the browser did not keep the session cookie. Open the dashboard over HTTPS.'
+      button.disabled = false
+      return
+    }
     const data = await res.json().catch(() => ({}))
     if (res.status === 429) {
       const min = Math.max(1, Math.ceil((data.retryAfterSec || 60) / 60))

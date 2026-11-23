@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   fmtWhen, fmtFare, dash, sourceLabel, istToday, addDays, dayRange, presetRange, quietLabel, isDay, istDayChanged,
+  isGroupQuiet, outputsNote,
 } from '../frontend/format.js'
 
 // 24 Nov 2026, 00:01 IST
@@ -81,6 +82,27 @@ test('presetRange', () => {
   })
   assert.deepEqual(presetRange('7days', now), { from: '2026-11-16T18:31:00.000Z' })
   assert.throws(() => presetRange('bogus', now))
+})
+
+test('isGroupQuiet: only inside the IST heartbeat window, only with a threshold', () => {
+  const at = (ist) => new Date(Date.parse(`2026-11-24T${ist}:00+05:30`))
+  const last = (ist) => new Date(Date.parse(`2026-11-24T${ist}:00+05:30`)).toISOString()
+  assert.equal(isGroupQuiet(last('09:00'), 120, '08:00', '23:00', at('12:00')), true) // 3 h silent, in window
+  assert.equal(isGroupQuiet(last('11:00'), 120, '08:00', '23:00', at('12:00')), false) // 1 h only
+  assert.equal(isGroupQuiet(last('09:00'), 120, '08:00', '23:00', at('23:30')), false) // after the window
+  assert.equal(isGroupQuiet(last('01:00'), 120, '08:00', '23:00', at('07:59')), false) // before the window
+  assert.equal(isGroupQuiet(null, 120, '08:00', '23:00', at('12:00')), true) // never heard from
+  assert.equal(isGroupQuiet(null, 0, '08:00', '23:00', at('12:00')), false) // no threshold
+  assert.equal(isGroupQuiet(null, undefined, undefined, undefined, at('12:00')), false)
+})
+
+test('outputsNote', () => {
+  assert.deepEqual(outputsNote({ outputsPending: 2, outputsFailed: 1 }), ['2 alerts waiting to send', '1 alert failed'])
+  assert.deepEqual(outputsNote({ outputsPending: 1 }), ['1 alert waiting to send'])
+  assert.deepEqual(outputsNote({ outputsPending: 0, outputsFailed: 0 }), [])
+  assert.deepEqual(outputsNote({}), [])
+  assert.deepEqual(outputsNote(undefined), [])
+  assert.deepEqual(outputsNote({ outputsPending: '3', outputsFailed: -1 }), [])
 })
 
 test('quietLabel', () => {

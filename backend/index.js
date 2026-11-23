@@ -1,9 +1,10 @@
+import { configLoaded } from './config-guard.js' // first: a malformed .env value is one fatal line
 import mongoose from 'mongoose'
 import { config } from './config.js'
-import { logger, quietConsole } from './logger.js'
-import { Admin, Booking, RawMessage } from './models.js'
+import { logger, quietConsole, maskPhone } from './logger.js'
+import { Admin, Booking, RawMessage, IngestKey } from './models.js'
 import { createApp } from './http/server.js'
-import { toBooking } from './http/routes.js'
+import { toBooking, releaseIngestKeys } from './http/routes.js'
 import { startWhatsApp, waState, flushCreds, getSock, closeWhatsApp } from './whatsapp/connection.js'
 import {
   attachCapture, loadGroupNames, seedGroupNames, groupNames, lastMessageAt, replaySpool, setPipeline, feedUnprocessed,
@@ -16,6 +17,9 @@ import { createSheets } from './outputs/sheets.js'
 import { createOutputs } from './outputs/index.js'
 import { createHeartbeat } from './jobs/heartbeat.js'
 import { createRetention } from './jobs/retention.js'
+import { createOutbox } from './jobs/outbox.js'
+
+configLoaded()
 
 if (!config.mongoUri) {
   logger.fatal('MONGODB_URI is not set. Copy .env.example to .env and fill it in.')
@@ -29,22 +33,21 @@ for (const [name, value] of [['API_TOKEN', config.apiToken], ['SESSION_SECRET', 
 }
 
 // The factories throw on a misconfigured enabled output or LLM: fail before connecting anything.
-let telegram, outputs, llm
+let telegram, sender, outputs, llm
 try {
   telegram = createTelegram(config, { fetch, logger })
-  outputs = createOutputs({
-    telegram,
-    sheets: createSheets(config, { fetch, logger }),
-    sender: createSender(config, { getSock, logger }),
-    logger,
-  })
+  sender = createSender(config, { getSock, logger })
+  outputs = createOutputs({ telegram, sheets: createSheets(config, { fetch, logger }), sender, logger })
   llm = createLlm(config, { fetch, logger })
 } catch (err) {
   logger.fatal(`${err.message}. See .env.example.`)
   process.exit(1)
 }
-// Outputs get the API booking shape on both paths (routes.js confirm passes toBooking(doc) too).
-const pipeline = createPipeline({ Booking, llm, onConfirmed: (doc) => outputs.onConfirmed(toBooking(doc)), logger })
+if (sender.enabled) logger.warn({ to: maskPhone(config.targetNumber) }, 'WHATSAPP_SEND_ENABLED=true: booking alerts are also sent from the linked number')
+// One onConfirmed for the pipeline and the dashboard's confirm: sends, records per-output delivery,
+// and the outbox job retries what is missing. Outputs get the API booking shape on both paths.
+const outbox = createOutbox({ Booking, outputs, logger })
+const pipeline = createPipeline({ Booking, llm, onConfirmed: (doc) => outbox.deliver(toBooking(doc)), logger })
 // Set before the first spool replay below, so replayed messages are processed too.
 setPipeline((msg) => pipeline.processMessage(msg))
 const heartbeat = createHeartbeat({
@@ -72,13 +75,15 @@ const recover = () => replaySpool().then(() => feedUnprocessed())
 recover()
 for (const ev of ['connected', 'reconnected']) mongoose.connection.on(ev, recover)
 await seedGroupNames()
+await releaseIngestKeys(IngestKey) // /ingest keys orphaned by the last stop; else their retries get 409 for 7 days
 
 // HTTP first and independent of WhatsApp: if the session stops, the dashboard still shows why.
 const app = createApp({
-  models: { Admin, Booking, RawMessage },
+  models: { Admin, Booking, RawMessage, IngestKey },
   config,
-  getHealthState: () => ({ whatsapp: waState, groupNames, lastMessageAt, heartbeat: heartbeat.state(), outputs: outputs.status() }),
-  onConfirmed: outputs.onConfirmed,
+  getHealthState: () => ({ whatsapp: waState, groupNames, lastMessageAt, heartbeat: heartbeat.state(), outputs: outputs.status(),
+    outputCounts: () => outbox.counts() }),
+  onConfirmed: (booking) => outbox.deliver(booking),
   pipeline,
   logger,
 })
@@ -87,6 +92,7 @@ const server = app.listen(config.port, config.host, () => {
   heartbeat.check() // so /health has the quiet state before the first 5-minute tick
   heartbeat.start()
   retention.start()
+  outbox.start()
 })
 server.on('error', (err) => {
   logger.fatal({ err }, 'http server failed')
@@ -99,6 +105,9 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
     closeWhatsApp() // first, so no message arrives after MongoDB is gone; a plain close, not a logout
     heartbeat.stop()
     retention.stop()
+    outbox.stop()
+    // Unsent ones stay undelivered on their bookings; the outbox sends them after the restart.
+    if (sender.pending?.()) logger.warn({ dropped: sender.pending() }, 'whatsapp sends still queued at shutdown were dropped')
     await flushCreds() // a cut creds.json write would cost the session
     await new Promise((resolve) => server.close(resolve))
     await mongoose.disconnect().catch(() => {})

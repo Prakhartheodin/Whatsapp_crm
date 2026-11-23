@@ -50,7 +50,11 @@ const bookingSchema = new mongoose.Schema(
     decidedBy: { type: String, enum: ['rules', 'llm', 'admin'], required: true },
     decidedAt: { type: Date, default: Date.now },
     otherSources: [{ _id: false, source: String, rawMessageId: mongoose.Schema.Types.ObjectId, receivedAt: Date }],
-    outputsSentAt: { type: Date, default: null },
+    outputsSentAt: { type: Date, default: null }, // claim time: outputs are started once per booking
+    // Per output: when it was delivered, or when retrying was given up (jobs/outbox.js).
+    delivered: { telegram: { type: Date, default: null }, sheets: { type: Date, default: null }, whatsappSend: { type: Date, default: null } },
+    givenUp: { telegram: { type: Date, default: null }, sheets: { type: Date, default: null }, whatsappSend: { type: Date, default: null } },
+    outputAttempts: { type: Number, default: 0 },
   },
   { collection: 'bookings' },
 )
@@ -61,4 +65,20 @@ bookingSchema.index({ rawMessageId: 1 })
 // ...and of messages folded in as duplicates (also checked by the unprocessed re-feed).
 bookingSchema.index({ 'otherSources.rawMessageId': 1 })
 
+bookingSchema.index({ status: 1, outputsSentAt: 1 }) // the outbox retry query
+
 export const Booking = mongoose.model('Booking', bookingSchema)
+
+// POST /ingest idempotency: one row per (source, clientMessageId), removed by MongoDB after 7 days.
+const ingestKeySchema = new mongoose.Schema(
+  {
+    source: { type: String, required: true },
+    clientMessageId: { type: String, required: true },
+    result: { type: Object, default: null }, // the /ingest answer; null while being processed
+    createdAt: { type: Date, default: Date.now, expires: '7d' },
+  },
+  { collection: 'ingest_keys' },
+)
+ingestKeySchema.index({ source: 1, clientMessageId: 1 }, { unique: true })
+
+export const IngestKey = mongoose.model('IngestKey', ingestKeySchema)

@@ -117,6 +117,68 @@ test('extractor: counts, ranges and everyday words do not become dates or blank 
   assert.equal(t('25-11-2026 6 am'), at('2026-11-25T06:00:00+05:30').toISOString())
 })
 
+test('extractor: a place keeps its whole comma-separated phrase, up to the next field', () => {
+  const e = (t) => extract(t, at('2026-11-20T10:00:00+05:30'))
+  const a = e('Sector 62, Noida to IGI airport T3, kal 5 am, Sedan, 9876543210')
+  assert.deepEqual([a.pickup, a.drop], ['Sector 62, Noida', 'IGI airport T3'])
+  // the drop ends at a plain comma (round 4 decision); only a sub-locality continues across it
+  const b = e('Noida Sector 62 to Connaught Place, New Delhi, Rs 900, 9876543210')
+  assert.deepEqual([b.pickup, b.drop], ['Noida Sector 62', 'Connaught Place'])
+  const c = e('Bhai, Delhi to Agra kal 6 am') // a greeting is not part of the place
+  assert.deepEqual([c.pickup, c.drop], ['Delhi', 'Agra'])
+  const d = e('Pickup: Sector 18, Noida, Drop: IGI T3, kal 5 am')
+  assert.deepEqual([d.pickup, d.drop], ['Sector 18, Noida', 'IGI T3'])
+})
+
+test('extractor: a comma ends the drop unless the part before it is a sub-locality', () => {
+  const e = (t) => extract(t, at('2026-11-20T10:00:00+05:30'))
+  const drop = (t) => e(t).drop
+  assert.equal(drop('Gurgaon se Jaipur, one way, Dzire'), 'Jaipur')
+  assert.equal(drop('Delhi to Agra, one way, Rs 2500'), 'Agra')
+  assert.equal(drop('Delhi to Agra, toll extra, kal 6 am'), 'Agra')
+  assert.equal(drop('Gurgaon to Delhi airport, flight at 9 am'), 'Delhi airport')
+  assert.equal(drop('Delhi to Agra, 2 din, return same day'), 'Agra')
+  assert.equal(drop('Delhi to Agra, AC car, kal 6 am'), 'Agra')
+  assert.equal(drop('Drop: Agra, one way'), 'Agra')
+  // a numbered or locality part continues across one comma
+  assert.equal(drop('IGI T3 to Sector 62, Noida, kal 5 am'), 'Sector 62, Noida')
+  assert.equal(drop('Noida to Block C, Vasant Kunj'), 'Block C, Vasant Kunj')
+  assert.equal(drop('Noida to Terminal 3, IGI Airport'), 'Terminal 3, IGI Airport')
+  // the pickup may span commas; newlines still separate words
+  assert.equal(e('Connaught Place, New Delhi to IGI T3').pickup, 'Connaught Place, New Delhi')
+  assert.deepEqual([e('Delhi\nto\nAgra').pickup, e('Delhi\nto\nAgra').drop], ['Delhi', 'Agra'])
+})
+
+test('extractor: several fares, ranges and per-km rates give no fare', () => {
+  const f = (t) => extract(t, at('2026-11-20T10:00:00+05:30')).fare
+  assert.equal(f('Delhi to Agra kal 6 am Sedan fare 6000 7000 8000 negotiable'), null)
+  assert.equal(f('fare 6000-7000'), null)
+  assert.equal(f('6000-7000'), null)
+  assert.equal(f('6000 - 7000 rs'), null)
+  assert.equal(f('fare 6000 ya 7000'), null)
+  assert.equal(f('12 rs per km'), null)
+  assert.equal(f('Rs 12/km'), null)
+  assert.equal(f('₹150 per km'), null)
+  // a single fare survives repetition, a rate beside it, and numbers that are not fares
+  assert.equal(f('Rs 3500'), 3500)
+  assert.equal(f('Rs 3500 final, 3500 rs only'), 3500)
+  assert.equal(f('Rs 3500 fixed, extra 15 rs per km'), 3500)
+  assert.equal(f('fare 3500 kal 6 am'), 3500)
+  assert.equal(f('fare 3500, 2-3 log'), 3500)
+  assert.equal(f('Rs. 3,50,000'), null) // out of range
+})
+
+test('extractor: an address number like "flat 12/3" is not a date', () => {
+  const e = (t) => extract(t, at('2026-11-20T10:00:00+05:30'))
+  const r = e('flat 12/3 se airport kal 6 am')
+  assert.equal(iso(r.tripDateTime), at('2026-11-21T06:00:00+05:30').toISOString())
+  assert.deepEqual([r.pickup, r.drop], ['flat 12/3', 'airport'])
+  assert.equal(iso(e('H.No. 4/2 to station, 6 am').tripDateTime), at('2026-11-21T06:00:00+05:30').toISOString())
+  assert.equal(iso(e('Gali 3/1 se bus stand aaj 5 pm').tripDateTime), at('2026-11-20T17:00:00+05:30').toISOString())
+  // without an address word it is still a date
+  assert.equal(iso(e('Delhi to Agra 12/3 6 am').tripDateTime), at('2027-03-12T06:00:00+05:30').toISOString())
+})
+
 test('extractor: "kal" or "tomorrow" sent between midnight and 4 am IST is ambiguous', () => {
   const t = (text, received) => iso(extract(text, at(received)).tripDateTime)
   assert.equal(t('kal subah 7 baje', '2026-11-21T00:10:00+05:30'), null)

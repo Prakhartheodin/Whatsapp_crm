@@ -103,6 +103,7 @@ function stop(status, handlers, details = {}, message = STOP_HELP[status]) {
  * (index.js runs the heartbeat check there, which sends the Telegram alert).
  */
 export async function startWhatsApp(handlers = {}) {
+  if (closing) return // shutting down: no new socket
   if (!(await prepareAuthDir())) {
     stop('logged_out', handlers, {}, `creds.json in ${config.authDir} is damaged and there is no valid creds.backup.json. Not starting WhatsApp, so no new identity is created. Move the auth folder aside and link again. ${see('logged_out')}`)
     return

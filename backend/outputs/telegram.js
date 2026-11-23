@@ -27,7 +27,7 @@ export function createTelegram(config, { fetch = globalThis.fetch, logger, sleep
       const res = await call(fetch, url, {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
       }, { logger, sleep, output: 'telegram', retryNetwork: true }) // a duplicate alert is harmless
-      return res !== null
+      return res.ok
     },
   }
 }
