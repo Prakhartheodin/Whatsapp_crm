@@ -23,6 +23,9 @@ const one = (v, c) =>
     : c === null ? v == null : String(v) === String(c)
 const match = (d, f) =>
   Object.entries(f).every(([k, c]) => {
+    if ((k === '$or' || k === '$and') && !c.length) throw new Error(`${k} must be a nonempty array`) // as MongoDB
+    if (k === '$or') return c.some((sub) => match(d, sub))
+    if (k === '$and') return c.every((sub) => match(d, sub))
     const v = get(d, k)
     return Array.isArray(v) ? v.some((e) => one(e, c)) : one(v, c)
   })
@@ -128,7 +131,7 @@ async function start(t) {
       body: body === undefined ? undefined : typeof body === 'string' ? body : JSON.stringify(body),
     })
   const login = (username, password) => call('/login', { method: 'POST', body: { username, password }, auth: false })
-  return { models, confirmed, call, login }
+  return { models, confirmed, call, login, errors }
 }
 
 const signed = (payload, secret = SECRET) => {
@@ -242,13 +245,35 @@ test('bookings list: filters, ordering, paging shape', async (t) => {
   body = await (await call('/api/bookings?status=review')).json()
   assert.deepEqual(body.items.map((b) => b.id), [id(1), id(2)]) // oldest first
   body = await (await call('/api/bookings?source=app')).json()
-  assert.deepEqual(body.items.map((b) => b.id), [id(5)])
+  assert.deepEqual(body.items.map((b) => b.id), [id(5), id(3)]) // 3 was also posted from the app (otherSources)
+  body = await (await call(`/api/bookings?source=${encodeURIComponent('whatsapp:Cabs')}`)).json()
+  assert.deepEqual(body.items.map((b) => b.id), [id(3)])
   body = await (await call(`/api/bookings?q=${encodeURIComponent('HYPERLINK("')}`)).json()
   assert.deepEqual(body.items.map((b) => b.id), [id(3)]) // regex chars are literal
   body = await (await call(`/api/bookings?from=${encodeURIComponent(ago(96).toISOString())}`)).json()
   assert.deepEqual(body.items.map((b) => b.id), [id(5)])
   body = await (await call('/api/bookings?page=2')).json()
   assert.deepEqual([body.items.length, body.total, body.page], [0, 2, 2])
+})
+
+test('search matches pickup, drop, contact and raw text; source matches folded duplicates', async (t) => {
+  const { call, models } = await start(t)
+  models.Booking.docs.push(
+    booking(30, 'review', 'rules', { pickup: 'Noida Sector 62', drop: 'Gurgaon', contact: '9123456789', rawText: 'need cab',
+      source: 'whatsapp:A', otherSources: [{ source: 'whatsapp:B', rawMessageId: null, receivedAt: ago(1) }] }),
+    booking(31, 'review', 'rules', { pickup: 'Agra', drop: 'Mathura', contact: null, rawText: 'Gurgaon drop wanted', source: 'whatsapp:B' }),
+  )
+  const ids = async (qs) => (await (await call(`/api/bookings?status=review&${qs}`)).json()).items.map((b) => b.id)
+  assert.deepEqual(await ids('q=noida%20SECTOR'), [id(30)]) // pickup, case-insensitive
+  assert.deepEqual(await ids('q=mathura'), [id(31)]) // drop
+  assert.deepEqual(await ids('q=9123456'), [id(30)]) // contact
+  assert.deepEqual(await ids('q=need%20cab'), [id(30)]) // raw text
+  assert.deepEqual(await ids('q=gurgaon'), [id(30), id(31)]) // drop of one, raw text of the other
+  assert.deepEqual(await ids('q=sector.62'), []) // regex chars stay literal
+  assert.deepEqual(await ids(`source=${encodeURIComponent('whatsapp:B')}`), [id(30), id(31)]) // folded + primary
+  assert.deepEqual(await ids(`source=${encodeURIComponent('whatsapp:A')}`), [id(30)])
+  assert.deepEqual(await ids(`source=${encodeURIComponent('whatsapp:B')}&q=mathura`), [id(31)]) // both apply
+  assert.deepEqual(await ids(`source=${encodeURIComponent('whatsapp:A')}&q=mathura`), [])
 })
 
 test('bare dates are IST days; timestamps need a zone; ties sort by id', async (t) => {
@@ -397,7 +422,29 @@ test('export streams an xlsx of confirmed bookings, formulas stay text', async (
   assert.match(filtered.headers.get('content-disposition'), /bookings-all-all\.xlsx/)
   const wb2 = new ExcelJS.Workbook()
   await wb2.xlsx.load(Buffer.from(await filtered.arrayBuffer()))
-  assert.equal(wb2.worksheets[0].rowCount, 2)
+  assert.equal(wb2.worksheets[0].rowCount, 3) // header + 5 (primary app) + 3 (app in otherSources)
+})
+
+test('export failing mid-stream: connection is cut, error logged once through our logger', async (t) => {
+  const { call, models, errors } = await start(t)
+  const find = models.Booking.find
+  models.Booking.find = (...args) => {
+    const q = find(...args)
+    q.cursor = async function* () {
+      for (let i = 0; i < 5000; i++) yield { ...models.Booking.docs[2], rawText: 'x'.repeat(200) + i }
+      throw new Error('cursor lost')
+    }
+    return q
+  }
+  const stderr = []
+  const original = console.error
+  console.error = (...a) => stderr.push(a)
+  t.after(() => { console.error = original })
+  // Headers are already out, so no 500 is possible: the client must see a failed download.
+  await assert.rejects(call('/export').then((res) => res.arrayBuffer()))
+  console.error = original
+  assert.deepEqual(stderr, []) // Express's default handler would print the raw stack here
+  assert.deepEqual(errors.splice(0), ['request failed mid-response'])
 })
 
 test('/health shape, "today" starts at IST midnight', async (t) => {

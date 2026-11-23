@@ -29,23 +29,32 @@ export function fmtWhen(iso, now = new Date()) {
   return `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]}, ${time}`
 }
 
-// Whole IST days, `to` inclusive (sent as the exclusive start of the next day).
+// A real calendar day "YYYY-MM-DD" (rejects 2026-02-31, which Date would roll over).
+export const isDay = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && !Number.isNaN(Date.parse(`${s}T00:00:00Z`)) && new Date(`${s}T00:00:00Z`).toISOString().slice(0, 10) === s
+
+// The API reads a bare day as the whole IST day, `to` inclusive, so send the days as picked.
 export const dayRange = (fromDay, toDay) => ({
-  from: new Date(istMidnight(fromDay)).toISOString(),
-  to: new Date(istMidnight(addDays(toDay, 1))).toISOString(),
+  from: isDay(fromDay) ? fromDay : undefined,
+  to: isDay(toDay) ? toDay : undefined,
 })
 
+export const PRESETS = ['last24', 'today', 'yesterday', '7days']
+
 // Open-ended presets have no `to`, so a re-fetch keeps catching new bookings.
+// `to` is inclusive on the API, so "yesterday" ends 1 ms before today's IST midnight.
 export function presetRange(name, now = new Date()) {
   const today = istToday(now)
   const iso = (ms) => new Date(ms).toISOString()
   switch (name) {
     case 'last24': return { from: iso(now.getTime() - DAY_MS) }
     case 'today': return { from: iso(istMidnight(today)) }
-    case 'yesterday': return { from: iso(istMidnight(addDays(today, -1))), to: iso(istMidnight(today)) }
+    case 'yesterday': return { from: iso(istMidnight(addDays(today, -1))), to: iso(istMidnight(today) - 1) }
     case '7days': return { from: iso(now.getTime() - 7 * DAY_MS) }
     default: throw new Error(`Unknown date preset: ${name}`)
   }
 }
+
+// True once the IST calendar day differs from the one the rows were rendered on.
+export const istDayChanged = (renderedDay, now = new Date()) => istToday(now) !== renderedDay
 
 export const quietLabel = (minutes) => `Quiet ${minutes % 60 === 0 ? `${minutes / 60}h` : `${minutes}m`}+`

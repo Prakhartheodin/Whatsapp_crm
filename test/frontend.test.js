@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  fmtWhen, fmtFare, dash, sourceLabel, istToday, addDays, dayRange, presetRange, quietLabel,
+  fmtWhen, fmtFare, dash, sourceLabel, istToday, addDays, dayRange, presetRange, quietLabel, isDay, istDayChanged,
 } from '../frontend/format.js'
 
 // 24 Nov 2026, 00:01 IST
@@ -52,9 +52,24 @@ test('IST calendar dates', () => {
   assert.equal(istToday(new Date('2026-11-23T18:29:00Z')), '2026-11-23')
   assert.equal(addDays('2026-11-24', -6), '2026-11-18')
   assert.equal(addDays('2026-03-01', -1), '2026-02-28')
-  assert.deepEqual(dayRange('2026-11-18', '2026-11-24'), {
-    from: '2026-11-17T18:30:00.000Z', to: '2026-11-24T18:30:00.000Z',
-  })
+})
+
+test('dayRange sends picked days as bare dates (the API treats them as whole IST days, to inclusive)', () => {
+  assert.deepEqual(dayRange('2026-11-18', '2026-11-24'), { from: '2026-11-18', to: '2026-11-24' })
+  assert.deepEqual(dayRange('', '2026-11-24'), { from: undefined, to: '2026-11-24' })
+  assert.deepEqual(dayRange('2026-02-31', 'junk'), { from: undefined, to: undefined })
+})
+
+test('isDay', () => {
+  assert.equal(isDay('2026-11-24'), true)
+  assert.equal(isDay('2026-02-31'), false)
+  assert.equal(isDay('2026-1-5'), false)
+  assert.equal(isDay(undefined), false)
+})
+
+test('istDayChanged flips exactly at IST midnight', () => {
+  assert.equal(istDayChanged('2026-11-23', new Date('2026-11-23T18:29:59Z')), false)
+  assert.equal(istDayChanged('2026-11-23', new Date('2026-11-23T18:30:00Z')), true)
 })
 
 test('presetRange', () => {
@@ -62,7 +77,7 @@ test('presetRange', () => {
   assert.deepEqual(presetRange('last24', now), { from: '2026-11-22T18:31:00.000Z' })
   assert.deepEqual(presetRange('today', now), { from: '2026-11-23T18:30:00.000Z' })
   assert.deepEqual(presetRange('yesterday', now), {
-    from: '2026-11-22T18:30:00.000Z', to: '2026-11-23T18:30:00.000Z',
+    from: '2026-11-22T18:30:00.000Z', to: '2026-11-23T18:29:59.999Z',
   })
   assert.deepEqual(presetRange('7days', now), { from: '2026-11-16T18:31:00.000Z' })
   assert.throws(() => presetRange('bogus', now))

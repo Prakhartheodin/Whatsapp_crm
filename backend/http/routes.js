@@ -51,6 +51,12 @@ const like = (q) => {
 }
 // Drops undefined filters (Mongoose would otherwise match field == null).
 const filter = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined))
+// { $or: [{ a: c }, { b: c }] }, or undefined when there is no condition.
+const anyOf = (fields, c) => c && { $or: fields.map((k) => ({ [k]: c })) }
+// A booking folded from several groups is found under each of them.
+const bySource = (q) => anyOf(['source', 'otherSources.source'], text(q, 'source'))
+// MongoDB rejects an empty $and.
+const allOf = (...cs) => (cs.some(Boolean) ? cs.filter(Boolean) : undefined)
 
 // ---- response shapes from the API contract ----
 const toBooking = (d) => ({
@@ -69,7 +75,11 @@ export function createRoutes({ models: { Booking, RawMessage }, config, getHealt
     const status = text(req.query, 'status') ?? 'confirmed'
     if (!STATUSES.includes(status)) throw badRequest('Invalid status.')
     const p = page(req.query)
-    const f = filter({ status, receivedAt: range(req.query), source: text(req.query, 'source'), rawText: like(req.query) })
+    const f = filter({
+      status,
+      receivedAt: range(req.query),
+      $and: allOf(bySource(req.query), anyOf(['rawText', 'pickup', 'drop', 'contact'], like(req.query))),
+    })
     const dir = status === 'review' ? 1 : -1
     const [docs, total] = await Promise.all([
       // _id breaks ties (same-second messages), so rows cannot repeat or vanish across pages.
@@ -139,7 +149,7 @@ export function createRoutes({ models: { Booking, RawMessage }, config, getHealt
 
   r.get('/export', async (req, res) => {
     const r = range(req.query)
-    const f = filter({ status: 'confirmed', receivedAt: r, source: text(req.query, 'source') })
+    const f = filter({ status: 'confirmed', receivedAt: r, $and: allOf(bySource(req.query)) })
     // IST dates; `to` minus 1 ms so an exclusive next-midnight bound names the day it ends.
     const day = (d) => (d ? ist(d).slice(0, 10) : 'all')
     const name = `bookings-${day(r?.$gte)}-${day(r?.$lte && new Date(r.$lte - 1))}.xlsx`

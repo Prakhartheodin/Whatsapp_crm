@@ -44,6 +44,7 @@
       <div class="filter-bar">
         <button type="button" class="filters-toggle" aria-expanded="false" aria-controls="bookings-filters">Filters</button>
         <ul class="chips" aria-label="Active filters"></ul>
+        <div class="scrim" aria-hidden="true"></div>
         <form class="filter-form" id="bookings-filters">
           <label>Date
             <select name="preset">
@@ -59,7 +60,7 @@
           <label>Source
             <select name="source"><option value="">All sources</option></select>
           </label>
-          <label class="search">Search <input type="search" name="q" maxlength="200" autocomplete="off"></label>
+          <label class="search">Search <input type="search" name="q" maxlength="100" autocomplete="off"></label>
           <button type="button" class="sheet-done primary">Done</button>
         </form>
       </div>
@@ -96,6 +97,7 @@
       <div class="filter-bar">
         <button type="button" class="filters-toggle" aria-expanded="false" aria-controls="raw-filters">Filters</button>
         <ul class="chips" aria-label="Active filters"></ul>
+        <div class="scrim" aria-hidden="true"></div>
         <form class="filter-form" id="raw-filters">
           <label>Date
             <select name="preset">
@@ -112,7 +114,7 @@
           <label>Group
             <select name="group"><option value="">All groups</option></select>
           </label>
-          <label class="search">Search <input type="search" name="q" maxlength="200" autocomplete="off"></label>
+          <label class="search">Search <input type="search" name="q" maxlength="100" autocomplete="off"></label>
           <button type="button" class="sheet-done primary">Done</button>
         </form>
       </div>

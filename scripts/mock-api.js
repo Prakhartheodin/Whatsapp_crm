@@ -23,11 +23,12 @@ const TYPES = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=
 // ---- made-up data ----
 const now = Date.now()
 const ago = (min) => new Date(now - min * 60000).toISOString()
+// Ids shaped like real group JIDs, so they pass the backend's `group` check too.
 const groups = [
-  { id: 'mock-a@g.us', name: 'Group A' },
-  { id: 'mock-b@g.us', name: 'Group B' },
-  { id: 'mock-c@g.us', name: 'Group C' },
-  { id: 'mock-d@g.us', name: 'Group D' },
+  { id: '120363000000000001@g.us', name: 'Group A' },
+  { id: '120363000000000002@g.us', name: 'Group B' },
+  { id: '120363000000000003@g.us', name: 'Group C' },
+  { id: '120363000000000004@g.us', name: 'Group D' },
 ]
 const outputs = { sheets: true, telegram: true, whatsappSend: false }
 let seq = 0
@@ -99,27 +100,55 @@ const readJson = (req) => new Promise((resolve, reject) => {
   req.on('data', (c) => { s += c; if (s.length > 10000) reject(new Error('too big')) })
   req.on('end', () => { try { resolve(s ? JSON.parse(s) : {}) } catch (e) { reject(e) } })
 })
+// ---- query validation, mirroring backend/http/routes.js (400 on anything malformed) ----
+const badRequest = (msg) => Object.assign(new Error(msg), { status: 400 })
+function text(url, key, max = 200) {
+  const v = url.searchParams.get(key)
+  if (v === null || v === '') return undefined
+  if (v.length > max) throw badRequest(`Invalid ${key}.`)
+  return v
+}
+const ISO = /^(\d{4}-\d{2}-\d{2})(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2}))?$/
+// A bare date is a whole IST day: `from` is its first millisecond, `to` its last (inclusive).
+function date(url, key) {
+  const v = text(url, key, 40)
+  if (v === undefined) return undefined
+  const m = ISO.exec(v)
+  const day = m && new Date(`${m[1]}T00:00:00Z`)
+  const d = m && new Date(v.length === 10 ? `${v}T00:00:00+05:30` : v)
+  if (!m || Number.isNaN(day.getTime()) || day.toISOString().slice(0, 10) !== m[1] || Number.isNaN(d.getTime())) {
+    throw badRequest(`Invalid ${key}: use YYYY-MM-DD or an ISO timestamp with a time zone.`)
+  }
+  return v.length === 10 && key === 'to' ? new Date(d.getTime() + 86_400_000 - 1) : d
+}
+function pageNo(url) {
+  const v = text(url, 'page', 6) ?? '1'
+  if (!/^\d+$/.test(v) || +v < 1 || +v > 10000) throw badRequest('Invalid page.')
+  return +v
+}
 function pageOf(items, url) {
-  const page = Math.max(1, Number(url.searchParams.get('page')) || 1)
+  const page = pageNo(url)
   return { items: items.slice((page - 1) * 50, page * 50), total: items.length, page, pageSize: 50 }
 }
-function inRange(iso, url) {
-  const from = url.searchParams.get('from')
-  const to = url.searchParams.get('to')
-  return (!from || iso >= new Date(from).toISOString()) && (!to || iso < new Date(to).toISOString())
+function rangeOf(url) {
+  const from = date(url, 'from')
+  const to = date(url, 'to')
+  return (iso) => (!from || new Date(iso) >= from) && (!to || new Date(iso) <= to)
 }
 const matches = (q, ...fields) => !q || fields.some((f) => f && String(f).toLowerCase().includes(q.toLowerCase()))
 
 function listBookings(url) {
-  const status = url.searchParams.get('status') || 'confirmed'
-  const source = url.searchParams.get('source')
-  const q = url.searchParams.get('q')
+  const status = text(url, 'status') ?? 'confirmed'
+  if (!['confirmed', 'review', 'rejected'].includes(status)) throw badRequest('Invalid status.')
+  const source = text(url, 'source')
+  const q = text(url, 'q', 100)
+  const inRange = rangeOf(url)
   const items = bookings
-    .filter((b) => b.status === status && inRange(b.receivedAt, url))
+    .filter((b) => b.status === status && inRange(b.receivedAt))
     .filter((b) => !source || b.source === source || b.otherSources.some((o) => o.source === source))
     .filter((b) => matches(q, b.pickup, b.drop, b.contact, b.rawText))
     .sort((a, b) => (status === 'review' ? a.receivedAt.localeCompare(b.receivedAt) : b.receivedAt.localeCompare(a.receivedAt)))
-  return pageOf(items, url)
+  return items
 }
 
 async function serveStatic(res, file) {
@@ -163,12 +192,14 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET' && p === '/api/me') return send(res, 200, { username: 'admin' })
     if (req.method === 'GET' && p === '/health') return send(res, 200, health())
-    if (req.method === 'GET' && p === '/api/bookings') return send(res, 200, listBookings(url))
+    if (req.method === 'GET' && p === '/api/bookings') return send(res, 200, pageOf(listBookings(url), url))
     if (req.method === 'GET' && p === '/api/raw') {
-      const group = url.searchParams.get('group')
-      const q = url.searchParams.get('q')
+      const group = text(url, 'group', 100)
+      if (group !== undefined && !/^[\d-]+@g\.us$/.test(group)) throw badRequest('Invalid group.')
+      const q = text(url, 'q', 100)
+      const inRange = rangeOf(url)
       const items = raw
-        .filter((m) => (!group || m.groupId === group) && inRange(m.timestamp, url) && matches(q, m.text))
+        .filter((m) => (!group || m.groupId === group) && inRange(m.timestamp) && matches(q, m.text))
         .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
       return send(res, 200, pageOf(items, url))
     }
@@ -179,25 +210,26 @@ const server = http.createServer(async (req, res) => {
       if (!b) return send(res, 404, { error: 'No such booking.' })
       const [, , verb] = action
       if (verb === 'undo') {
-        if (b.decidedBy !== 'admin' || b.status === 'review') return send(res, 409, { error: 'Only an admin decision can be undone.' })
+        if (b.decidedBy !== 'admin' || !['confirmed', 'rejected'].includes(b.status)) return send(res, 409, { error: 'This booking was already changed. Reload.' })
         const outputsAlreadySent = b.status === 'confirmed' && (outputs.sheets || outputs.telegram || outputs.whatsappSend)
         Object.assign(b, { status: 'review', decidedAt: new Date().toISOString() })
         return send(res, 200, { item: b, outputsAlreadySent })
       }
-      if (b.status !== 'review') return send(res, 409, { error: 'This message was already decided.' })
+      if (b.status !== 'review') return send(res, 409, { error: 'This booking was already changed. Reload.' })
       Object.assign(b, { status: verb === 'confirm' ? 'confirmed' : 'rejected', decidedBy: 'admin', decidedAt: new Date().toISOString() })
       return send(res, 200, { item: b })
     }
     if (req.method === 'GET' && p === '/export') {
       // The real backend streams .xlsx; the mock sends a CSV so it needs no dependencies.
-      const rows = listBookings(url).items.map((b) => [b.receivedAt, b.pickup, b.drop, b.fare, b.contact].map((v) => `"${String(v ?? '').replace(/"/g, '""')}"`).join(','))
+      const rows = listBookings(url).map((b) => [b.receivedAt, b.pickup, b.drop, b.fare, b.contact].map((v) => `"${String(v ?? '').replace(/"/g, '""')}"`).join(','))
       res.writeHead(200, { ...HEADERS, 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="bookings-MOCK.csv"' })
       return res.end(['receivedAt,pickup,drop,fare,contact', ...rows].join('\n'))
     }
     send(res, 404, { error: 'Not found' })
   } catch (e) {
-    send(res, 400, { error: `Bad request: ${e.message}` })
+    send(res, 400, { error: e.status === 400 ? e.message : `Bad request: ${e.message}` })
   }
 })
 
-server.listen(PORT, () => console.log(`DEV MOCK (made-up data) on http://localhost:${PORT}  login: admin / admin-password-123`))
+// Loopback only: the preview must not be reachable from the LAN.
+server.listen(PORT, '127.0.0.1', () => console.log(`DEV MOCK (made-up data) on http://localhost:${PORT}  login: admin / admin-password-123`))

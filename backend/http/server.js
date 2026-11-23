@@ -40,7 +40,9 @@ export function createApp(deps) {
   app.use((err, req, res, next) => {
     if (res.headersSent) {
       logger.error({ err, method: req.method, path: req.path }, 'request failed mid-response')
-      return next(err) // lets Express close the connection
+      // Cut the connection so the client sees a failed download, not a truncated file.
+      // Not next(err): Express's default handler would print the raw stack to stderr.
+      return res.destroy()
     }
     // Client errors from body parsing (bad JSON, too large) and our own validation.
     if (err.expose && err.status >= 400 && err.status < 500) {

@@ -1,6 +1,6 @@
 import { api, qs } from './api.js'
 import {
-  DASH, dash, fmtWhen, fmtFare, sourceLabel, istToday, addDays, dayRange, presetRange, quietLabel,
+  DASH, dash, fmtWhen, fmtFare, sourceLabel, istToday, addDays, dayRange, presetRange, quietLabel, isDay, PRESETS, istDayChanged,
 } from './format.js'
 
 const POLL_MS = 15000
@@ -51,10 +51,10 @@ const WA_STATES = {
   connecting: { tone: 'warn', text: 'Connecting' },
   open: { tone: 'ok', text: 'Connected' },
   reconnecting: { tone: 'warn', text: 'Reconnecting' },
-  logged_out: { tone: 'danger', text: 'Logged out', panel: 'WhatsApp session logged out. Capture is stopped. Re-link from the server (see README: Re-linking after a logout).' },
-  needs_link: { tone: 'danger', text: 'Not linked', panel: 'No WhatsApp session on the server. Capture is stopped. Link the number from a terminal (see README: Linking the number).' },
-  replaced: { tone: 'danger', text: 'Session taken over', panel: 'Another process or device took over this WhatsApp session. Capture is stopped. Stop the other one and restart the service; no re-link needed.' },
-  blocked: { tone: 'danger', text: 'Account restricted', panel: 'WhatsApp restricted this account. Capture is stopped. Do not re-link; check WhatsApp on the phone.' },
+  logged_out: { tone: 'danger', text: 'Logged out', panel: 'WhatsApp session logged out. Capture is stopped. Re-link from the server (see README: Re-link after a logout).' },
+  needs_link: { tone: 'danger', text: 'Not linked', panel: 'No WhatsApp session on the server. Capture is stopped. Link the number from a terminal (see README: Link the WhatsApp number).' },
+  replaced: { tone: 'danger', text: 'Session taken over', panel: 'Another process or device took over this WhatsApp session. Capture is stopped. Stop the other one and restart the service; no re-link needed (see README: What each stop status means).' },
+  blocked: { tone: 'danger', text: 'Account restricted', panel: 'WhatsApp restricted this account. Capture is stopped. Do not re-link; check WhatsApp on the phone (see README: What each stop status means).' },
 }
 // Unknown values show the raw status in warn, never a guessed label.
 const waState = (h) => (Object.hasOwn(WA_STATES, h.whatsapp?.status) ? WA_STATES[h.whatsapp.status] : { tone: 'warn', text: dash(h.whatsapp?.status) })
@@ -84,6 +84,8 @@ async function loadHealth() {
   const sources = [...groups.map((g) => [`whatsapp:${g.name}`, g.name]), ['app', 'App']]
   for (const sel of document.querySelectorAll('select[name="source"]')) setOptions(sel, sources)
   setOptions($('#raw-filters').group, groups.map((g) => [g.id, g.name]))
+  bookings.dropStaleOption()
+  raw.dropStaleOption()
   if (current === 'status') renderStatus()
 }
 
@@ -152,7 +154,9 @@ function renderStatus() {
 
 // ---------- Feeds: Bookings and Raw share filters, paging, polling and new-item handling ----------
 let unseen = 0
-const lastSeenAtStart = store.get('lastSeen', null)
+// Newest booking time the owner has seen: from the last visit, then from each time the tab was hidden.
+let seenMark = store.get('lastSeen', null)
+if (typeof seenMark !== 'string') seenMark = null
 
 function feed(cfg) {
   const section = $(`#screen-${cfg.name}`)
@@ -164,8 +168,15 @@ function feed(cfg) {
   const more = $('.load-more', section)
   const empty = $('.empty', section)
   const defaults = { preset: cfg.preset, fromDay: '', toDay: '', [cfg.field]: '', q: '' }
-  const saved = store.get(`filters:${cfg.name}`, {})
-  const filters = Object.fromEntries(Object.keys(defaults).map((k) => [k, typeof saved[k] === 'string' ? saved[k] : defaults[k]]))
+  // Saved filters are untrusted (old versions, hand edits): keep only values the form can express.
+  const saved = store.get(`filters:${cfg.name}`, {}) || {}
+  const ok = {
+    preset: (v) => [...form.preset.options].some((o) => o.value === v) && (v === 'all' || v === 'custom' || PRESETS.includes(v)),
+    fromDay: isDay, toDay: isDay,
+    [cfg.field]: (v) => typeof v === 'string' && v.length <= 200,
+    q: (v) => typeof v === 'string' && v.length <= 100,
+  }
+  const filters = Object.fromEntries(Object.keys(defaults).map((k) => [k, ok[k](saved[k]) ? saved[k] : defaults[k]]))
   let ids = new Set()
   let pending = []
   let page = 1
@@ -178,10 +189,7 @@ function feed(cfg) {
   function range() {
     if (filters.preset === 'all') return {}
     if (filters.preset !== 'custom') return presetRange(filters.preset)
-    return {
-      from: filters.fromDay ? dayRange(filters.fromDay, filters.fromDay).from : undefined,
-      to: filters.toDay ? dayRange(filters.toDay, filters.toDay).to : undefined,
-    }
+    return dayRange(filters.fromDay, filters.toDay)
   }
   const url = (p) => `${cfg.url}?${qs({ ...range(), [cfg.field]: filters[cfg.field], q: filters.q.trim(), page: p })}`
   const isFiltered = () => Object.keys(defaults).some((k) => filters[k] !== defaults[k])
@@ -207,7 +215,7 @@ function feed(cfg) {
     list.removeAttribute('aria-busy')
   }
 
-  const ok = () => { lastOk = new Date().toISOString(); errorBar(section, false) }
+  const loadedOk = () => { lastOk = new Date().toISOString(); errorBar(section, false) }
   const fail = () => errorBar(section, true, lastOk)
 
   async function reset() {
@@ -223,7 +231,7 @@ function feed(cfg) {
       add(data.items, 'bottom')
       total = data.total
       loaded = true
-      ok()
+      loadedOk()
       cfg.afterLoad?.(list)
     } catch {
       if (my !== gen) return
@@ -233,21 +241,23 @@ function feed(cfg) {
     update()
   }
 
-  // shortcut: only page 1 is checked for new items, so a burst of more than 50 between polls shows the newest 50; upgrade if that ever happens.
   async function refresh() {
     if (!loaded) return reset()
     const my = gen
     try {
       const data = await api(url(1))
       if (my !== gen) return
-      ok()
+      loadedOk()
       total = data.total
       const fresh = data.items.filter((i) => !ids.has(i.id) && !pending.some((p) => p.id === i.id))
       if (fresh.length) {
-        if (window.scrollY > 120) pending = [...fresh, ...pending]
-        else inject(fresh)
         if (cfg.name === 'bookings' && (window.scrollY > 120 || !document.hasFocus())) { unseen += fresh.length; updateTitle() }
+        // A whole page of new items may hide more beyond it (a long hidden tab): reload in order.
+        if (fresh.length === data.items.length && data.items.length >= data.pageSize) return reset()
+        if (window.scrollY > 120) pending = [...fresh, ...pending]
+        else { inject([...fresh, ...pending]); pending = [] }
       }
+      cfg.afterLoad?.(list)
     } catch {
       if (my === gen) fail()
     }
@@ -272,17 +282,20 @@ function feed(cfg) {
   })
 
   more.addEventListener('click', async () => {
+    const my = gen
     more.disabled = true
     try {
       const data = await api(url(page + 1))
+      if (my !== gen) return // filters changed meanwhile: these rows belong to the old list
       page += 1
       total = data.total
       add(data.items, 'bottom')
-      ok()
+      loadedOk()
     } catch {
-      fail()
+      if (my === gen) fail()
+    } finally {
+      more.disabled = false
     }
-    more.disabled = false
     update()
   })
 
@@ -337,7 +350,17 @@ function feed(cfg) {
   }
   toggle.addEventListener('click', () => setSheet(!section.classList.contains('sheet-open')))
   $('.sheet-done', section).addEventListener('click', () => setSheet(false))
-  form.addEventListener('keydown', (e) => { if (e.key === 'Escape' && section.classList.contains('sheet-open')) setSheet(false) })
+  $('.scrim', section).addEventListener('click', () => setSheet(false))
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && section.classList.contains('sheet-open')) setSheet(false) })
+
+  // After /health fills the dropdown: a saved source/group that no longer exists is dropped.
+  function dropStaleOption() {
+    const sel = form[cfg.field]
+    if (filters[cfg.field] && sel.options.length > 1 && sel.value !== filters[cfg.field]) {
+      filters[cfg.field] = ''
+      changed()
+    }
+  }
 
   syncForm()
   return {
@@ -345,6 +368,9 @@ function feed(cfg) {
     refresh,
     newest: () => newest,
     syncForm,
+    dropStaleOption,
+    // The next show/refresh reloads from scratch (rows rendered on an earlier IST day).
+    invalidate: () => { gen += 1; loaded = false },
   }
 }
 
@@ -410,10 +436,12 @@ const bookings = feed({
   render: bookingRow, skeleton: skeletonRow,
   noun: (n) => (n === 1 ? 'booking' : 'bookings'),
   emptyText: () => 'No bookings match these filters.',
+  // Placed after every load and refresh, so it also appears for a tab left open overnight.
   afterLoad(list) {
-    if (!lastSeenAtStart) return
+    list.querySelector('tr.divider')?.remove()
+    if (!seenMark) return
     const rows = [...list.querySelectorAll('tr[data-id]')]
-    const i = rows.findIndex((r) => r.dataset.at <= lastSeenAtStart)
+    const i = rows.findIndex((r) => r.dataset.at <= seenMark)
     if (i > 0) rows[i].before(el('tr', { class: 'divider' }, el('td', { colspan: '7', text: 'New since you last looked' })))
   },
 })
@@ -428,7 +456,8 @@ const raw = feed({
 
 function saveLastSeen() {
   const n = bookings.newest()
-  if (n && n > (store.get('lastSeen', '') || '')) store.set('lastSeen', n)
+  if (n && (!seenMark || n > seenMark)) seenMark = n
+  if (seenMark && seenMark > (store.get('lastSeen', '') || '')) store.set('lastSeen', seenMark)
 }
 
 // ---------- Review ----------
@@ -437,6 +466,7 @@ const reviewList = $('.review-list', reviewSection)
 let reviewKey = ''
 let reviewOk = null
 let reviewLoaded = false
+let reviewDecisions = 0 // bumped on every decision; a list fetched before it is stale
 
 const alertsOn = () => Boolean(health?.outputs && (health.outputs.telegram || health.outputs.sheets || health.outputs.whatsappSend))
 
@@ -446,6 +476,7 @@ async function loadReview() {
     reviewList.replaceChildren(...Array.from({ length: 3 }, () => el('div', { class: 'review-card skeleton', 'aria-hidden': 'true' },
       el('span', { class: 'bone' }), el('span', { class: 'bone' }), el('span', { class: 'bone' }))))
   }
+  const started = reviewDecisions
   let data
   try {
     data = await api(`/api/bookings?${qs({ status: 'review', page: 1 })}`)
@@ -454,6 +485,7 @@ async function loadReview() {
     errorBar(reviewSection, true, reviewOk)
     return
   }
+  if (started !== reviewDecisions) return // a decision landed meanwhile; this list may still hold that card
   reviewOk = new Date().toISOString()
   errorBar(reviewSection, false)
   reviewList.removeAttribute('aria-busy')
@@ -483,26 +515,37 @@ function reviewCard(b) {
     error,
     el('div', { class: 'actions' }, confirm, reject))
 
-  async function decide(action) {
-    confirm.disabled = reject.disabled = true
-    error.textContent = ''
-    try {
-      await api(`/api/bookings/${encodeURIComponent(b.id)}/${action}`, { method: 'POST', body: {} })
-    } catch (e) {
-      error.textContent = `Couldn't save: ${e.message}`
-      confirm.disabled = reject.disabled = false
-      return
-    }
+  function removeCard() {
     const next = card.nextElementSibling || card.previousElementSibling
     card.remove()
     reviewKey = [...reviewList.children].map((c) => c.dataset.id).join()
     $('.empty', reviewSection).hidden = reviewList.children.length > 0
     setBadge(Math.max(0, pendingCount - 1))
-    ;(next?.querySelector('button') || $('#h-review')).focus()
+    return next?.querySelector('button') || $('#h-review')
+  }
+
+  async function decide(action) {
+    reviewDecisions += 1
+    confirm.disabled = reject.disabled = true
+    error.textContent = ''
+    try {
+      await api(`/api/bookings/${encodeURIComponent(b.id)}/${action}`, { method: 'POST', body: {} })
+    } catch (e) {
+      if (e.status === 409) { // decided elsewhere: the card is out of date either way
+        removeCard().focus()
+        showToast('Already decided elsewhere. Removed from Review.')
+        return
+      }
+      error.textContent = `Couldn't save: ${e.message}`
+      confirm.disabled = reject.disabled = false
+      return
+    }
+    const focusBack = removeCard()
     const confirmed = action === 'confirm'
     showToast(confirmed ? 'Marked as booking' : 'Marked as not a booking',
       confirmed && alertsOn() ? 'Undo (alerts already sent)' : 'Undo',
       async () => {
+        reviewDecisions += 1
         try {
           await api(`/api/bookings/${encodeURIComponent(b.id)}/undo`, { method: 'POST', body: {} })
           showToast('Moved back to Review')
@@ -510,7 +553,8 @@ function reviewCard(b) {
           showToast(`Couldn't undo: ${e.message}`)
         }
         loadReview()
-      })
+      },
+      focusBack)
   }
   confirm.addEventListener('click', () => decide('confirm'))
   reject.addEventListener('click', () => decide('reject'))
@@ -519,14 +563,22 @@ function reviewCard(b) {
 
 // ---------- Toast ----------
 let toastTimer
-function showToast(message, actionLabel, onAction) {
+// `focusBack`: where focus goes when the toast closes while focused (the next card's button).
+function showToast(message, actionLabel, onAction, focusBack) {
   const region = $('#toast-region')
   clearTimeout(toastTimer)
-  const box = el('div', { class: 'toast' }, el('span', { text: message }),
-    actionLabel ? el('button', { type: 'button', text: actionLabel, onclick: () => { box.remove(); onAction() } }) : null)
+  const close = () => {
+    const hadFocus = box.contains(document.activeElement)
+    box.remove()
+    if (hadFocus && focusBack?.isConnected) focusBack.focus()
+  }
+  const button = actionLabel ? el('button', { type: 'button', text: actionLabel, onclick: () => { close(); onAction() } }) : null
+  const box = el('div', { class: 'toast' }, el('span', { text: message }), button)
   region.replaceChildren(box)
-  // Stays while hovered or focused, so the Undo button can't vanish under the pointer or keyboard.
-  const hide = () => { if (box.matches(':hover, :focus-within')) toastTimer = setTimeout(hide, 1000); else box.remove() }
+  // The acted-on button is gone, so focus is on <body>: put it on Undo. Never take it from a field being typed in.
+  if (button && focusBack && (document.activeElement === document.body || !document.activeElement)) button.focus()
+  // Stays while hovered or focused, so Undo can't vanish under the pointer or keyboard.
+  const hide = () => { if (box.matches(':hover, :focus-within')) toastTimer = setTimeout(hide, 1000); else close() }
   toastTimer = setTimeout(hide, 6000)
 }
 
@@ -565,6 +617,20 @@ async function countExport() {
 }
 exportForm.addEventListener('input', debounce(countExport))
 exportForm.addEventListener('submit', (e) => e.preventDefault())
+// A plain link would show raw JSON on an expired session; check it first (api() sends a 401 to /login).
+exportLink.addEventListener('click', async (e) => {
+  if (!exportLink.getAttribute('href')) return
+  e.preventDefault()
+  const href = exportLink.href
+  try {
+    await api('/api/me')
+  } catch (err) {
+    if (err.status !== undefined) exportCount.textContent = `Couldn't start the download: ${err.message}`
+    else if (err.message !== 'Session expired') exportCount.textContent = "Couldn't reach the server. Try again."
+    return
+  }
+  location.assign(href)
+})
 // role="button" on a link: Space should activate it too.
 exportLink.addEventListener('keydown', (e) => { if (e.key === ' ' && exportLink.href) { e.preventDefault(); exportLink.click() } })
 
@@ -583,7 +649,8 @@ function updateTitle() {
 }
 
 function route(moveFocus) {
-  const name = location.hash.slice(1) in SCREENS ? location.hash.slice(1) : 'bookings'
+  const hash = location.hash.slice(1)
+  const name = Object.hasOwn(SCREENS, hash) ? hash : 'bookings'
   current = name
   for (const id of Object.keys(SCREENS)) $(`#screen-${id}`).hidden = id !== name
   for (const a of document.querySelectorAll('[data-tab]')) {
@@ -596,14 +663,23 @@ function route(moveFocus) {
 }
 
 let ticking = false
+let renderedDay = istToday()
 async function tick() {
   if (document.hidden || ticking) return
   ticking = true
+  // Past IST midnight "today shows time only" and the date presets mean another day: reload the lists.
+  if (istDayChanged(renderedDay)) {
+    renderedDay = istToday()
+    bookings.invalidate()
+    raw.invalidate()
+    reviewKey = ''
+  }
   try { await Promise.all([loadHealth(), screens[current].refresh?.()]) } finally { ticking = false }
 }
 
 window.addEventListener('hashchange', () => route(true))
 window.addEventListener('focus', () => { if (window.scrollY <= 120 && unseen) { unseen = 0; updateTitle() } })
+// Hidden: remember what was seen. Visible again: refresh, which also moves the divider to that point.
 document.addEventListener('visibilitychange', () => (document.hidden ? saveLastSeen() : tick()))
 window.addEventListener('pagehide', saveLastSeen)
 setInterval(tick, POLL_MS)
